@@ -7,9 +7,7 @@ import React, {
   useState, useEffect, useRef, useCallback, useMemo,
 } from 'react';
 import './App.css';
-
-// ── Toggle this to switch DEV ↔ LIVE ────────────────────────
-const DEV_MODE = false;
+import { DEV_MODE } from './config';
 
 // When DEV_MODE = false, install the live hooks:
 import { useSpacetimeDB, useTable, useReducer } from 'spacetimedb/react';
@@ -19,8 +17,8 @@ import { tables, reducers } from './module_bindings';
 // CONFIGURATION
 // ============================================================
 const AGENT_CFG = {
-  scout:           { color: '#00D4FF', dim: 'rgba(0,212,255,0.12)',  emoji: '🔍', label: 'Scout' },
-  strategist:      { color: '#FFB800', dim: 'rgba(255,184,0,0.12)',  emoji: '📊', label: 'Strategist' },
+  scout: { color: '#00D4FF', dim: 'rgba(0,212,255,0.12)', emoji: '🔍', label: 'Scout' },
+  strategist: { color: '#FFB800', dim: 'rgba(255,184,0,0.12)', emoji: '📊', label: 'Strategist' },
   devils_advocate: { color: '#FF3366', dim: 'rgba(255,51,102,0.12)', emoji: '😈', label: "Devil's Adv" },
 };
 
@@ -59,9 +57,9 @@ const INITIAL_AGENTS = Object.entries(AGENT_CFG).map(([id, cfg]) => ({
 // HELPERS
 // ============================================================
 const fmt = (secs) => {
-  const h = String(Math.floor(secs / 3600)).padStart(2,'0');
-  const m = String(Math.floor((secs % 3600) / 60)).padStart(2,'0');
-  const s = String(secs % 60).padStart(2,'0');
+  const h = String(Math.floor(secs / 3600)).padStart(2, '0');
+  const m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+  const s = String(secs % 60).padStart(2, '0');
   return `${h}:${m}:${s}`;
 };
 const tsNow = () => Date.now() / 1000;
@@ -73,38 +71,38 @@ let _mid = 10; const nxtMsg = () => ++_mid;
 // ============================================================
 function AgentGraph({ agents, agentMessages, reasoningLog }) {
   const now = tsNow();
-  const recentMsgs = agentMessages.filter(m => now - m.sentAt < 12);
+  const recentMsgs = agentMessages.filter(m => now - Number(m.sentAt) < 12);
 
   const latestDevils = useMemo(() =>
     [...reasoningLog].filter(r => r.agentId === 'devils_advocate')
-      .sort((a,b) => b.timestamp - a.timestamp)[0],
-  [reasoningLog]);
+      .sort((a, b) => Number(b.timestamp) - Number(a.timestamp))[0],
+    [reasoningLog]);
   const isConflict = latestDevils?.hasConflict ?? false;
 
   const hasMsgBetween = (a, b) =>
-    recentMsgs.some(m => (m.fromAgent===a&&m.toAgent===b)||(m.fromAgent===b&&m.toAgent===a));
+    recentMsgs.some(m => (m.fromAgent === a && m.toAgent === b) || (m.fromAgent === b && m.toAgent === a));
 
   const agentMap = useMemo(() => Object.fromEntries(agents.map(a => [a.agentId, a])), [agents]);
   const latestConf = useMemo(() => {
     const out = {};
-    ['scout','strategist','devils_advocate'].forEach(id => {
+    ['scout', 'strategist', 'devils_advocate'].forEach(id => {
       const entries = reasoningLog.filter(r => r.agentId === id);
-      out[id] = entries.length ? entries[0].confidence : 0;
+      out[id] = entries.length ? Number(entries[0].confidence) : 0;
     });
     return out;
   }, [reasoningLog]);
 
   // Node positions in a triangle (compressed to fit any panel height)
   const POS = {
-    scout:           { cx: 210, cy: 68 },
-    strategist:      { cx: 75,  cy: 268 },
+    scout: { cx: 210, cy: 68 },
+    strategist: { cx: 75, cy: 268 },
     devils_advocate: { cx: 345, cy: 268 },
   };
 
   const pairs = [
-    ['scout','strategist'],
-    ['scout','devils_advocate'],
-    ['strategist','devils_advocate'],
+    ['scout', 'strategist'],
+    ['scout', 'devils_advocate'],
+    ['strategist', 'devils_advocate'],
   ];
 
   return (
@@ -197,7 +195,7 @@ function AgentGraph({ agents, agentMessages, reasoningLog }) {
 // ============================================================
 function ReasoningEntry({ entry, sessionStart }) {
   const cfg = AGENT_CFG[entry.agentId] ?? { color: '#8892A4', label: entry.agentId };
-  const elapsed = Math.max(0, Math.round(entry.timestamp - sessionStart));
+  const elapsed = Math.max(0, Math.round(Number(entry.timestamp) - sessionStart));
 
   return (
     <div className="reasoning-entry" style={{
@@ -278,25 +276,33 @@ function MemoryCard({ agentId, reasoningLog }) {
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
         <span style={{ fontSize: '1rem' }}>{cfg.emoji}</span>
-        <span style={{ fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.75rem',
-          color: cfg.color, letterSpacing: 1 }}>
+        <span style={{
+          fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.75rem',
+          color: cfg.color, letterSpacing: 1
+        }}>
           {cfg.label.toUpperCase()}
         </span>
-        <span style={{ fontFamily: 'Rajdhani', fontSize: '0.65rem', color: '#4A5568',
-          marginLeft: 'auto' }}>{entries.length} memories</span>
+        <span style={{
+          fontFamily: 'Rajdhani', fontSize: '0.65rem', color: '#4A5568',
+          marginLeft: 'auto'
+        }}>{entries.length} memories</span>
       </div>
       <div style={{ overflowY: 'auto', maxHeight: 130, display: 'flex', flexDirection: 'column', gap: 5 }}>
         {entries.length === 0 ? (
-          <p style={{ fontFamily: 'Space Mono', fontSize: '0.6rem', color: '#4A5568',
-            fontStyle: 'italic' }}>No memories yet…</p>
+          <p style={{
+            fontFamily: 'Space Mono', fontSize: '0.6rem', color: '#4A5568',
+            fontStyle: 'italic'
+          }}>No memories yet…</p>
         ) : entries.map((e, i) => (
           <div key={e.logId ?? i} style={{
             background: '#080B14', borderRadius: 3, padding: '5px 8px',
             borderLeft: `2px solid ${cfg.color}40`,
           }}>
-            <p style={{ fontFamily: 'Space Mono', fontSize: '0.6rem', color: '#8892A4',
+            <p style={{
+              fontFamily: 'Space Mono', fontSize: '0.6rem', color: '#8892A4',
               lineHeight: 1.5, overflow: 'hidden',
-              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+              display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical'
+            }}>
               {e.decision}
             </p>
           </div>
@@ -311,34 +317,63 @@ function MemoryCard({ agentId, reasoningLog }) {
 // ============================================================
 export default function App() {
   // ── State ──────────────────────────────────────────────────
-  const [agents,        setAgents]        = useState(INITIAL_AGENTS);
-  const [reasoningLog,  setReasoningLog]  = useState([]);
+  const [agents, setAgents] = useState(INITIAL_AGENTS);
+  const [reasoningLog, setReasoningLog] = useState([]);
   const [agentMessages, setAgentMessages] = useState([]);
-  const [sharedContext, setSharedContext] = useState([{ key:'crisis', value: DEV_CRISIS }]);
-  const [sessionSecs,   setSessionSecs]   = useState(0);
-  const [isPaused,      setIsPaused]      = useState(false);
-  const [isLaunched,    setIsLaunched]    = useState(false);
-  const [showLaunch,    setShowLaunch]    = useState(false);
-  const [launchCrisis,  setLaunchCrisis]  = useState(DEV_CRISIS);
-  const [injInput,      setInjInput]      = useState('');
-  const [injAgent,      setInjAgent]      = useState('scout');
-  const [injections,    setInjections]    = useState([]);
+  const [sharedContext, setSharedContext] = useState([{ key: 'crisis', value: DEV_CRISIS }]);
+  const [sessionSecs, setSessionSecs] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [isLaunched, setIsLaunched] = useState(false);
+  const [showLaunch, setShowLaunch] = useState(false);
+  const [launchCrisis, setLaunchCrisis] = useState(DEV_CRISIS);
+  const [injInput, setInjInput] = useState('');
+  const [injAgent, setInjAgent] = useState('scout');
+  const [injections, setInjections] = useState([]);
   const sessionStart = useRef(tsNow());
-  const feedRef      = useRef(null);
-  const simActive    = useRef(false);
+  const feedRef = useRef(null);
+  const simActive = useRef(false);
+
+  // ── LIVE MODE hooks ────────────────────────────────────────
+  const connState = useSpacetimeDB();
+  const [liveAgents, liveAgentsReady] = useTable(tables.agent);
+  const [liveReasoning, liveReasoningReady] = useTable(tables.reasoning_log);
+  const [liveMessages] = useTable(tables.agent_messages);
+  const [liveContext] = useTable(tables.shared_context);
+  const spawnSwarm = useReducer(reducers.spawn_swarm);
+  const injectBelief = useReducer(reducers.inject_belief);
 
   // ── Derived ────────────────────────────────────────────────
-  const crisis = sharedContext.find(c => c.key === 'crisis')?.value ?? DEV_CRISIS;
-  const totalConflicts   = reasoningLog.filter(r => r.hasConflict).length;
-  const avgConfidence    = reasoningLog.length
-    ? reasoningLog.reduce((s, r) => s + r.confidence, 0) / reasoningLog.length : 0;
-  const latestByAgent    = useMemo(() => {
+  const agentsData = DEV_MODE
+    ? agents
+    : (liveAgentsReady && liveAgents.length > 0 ? [...liveAgents] : INITIAL_AGENTS);
+  const reasoningData = DEV_MODE
+    ? reasoningLog
+    : [...liveReasoning].sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+  const messagesData = DEV_MODE
+    ? agentMessages
+    : [...liveMessages];
+  const sharedContextData = DEV_MODE
+    ? sharedContext
+    : (liveContext.length > 0 ? [...liveContext] : [{ key: 'crisis', value: DEV_CRISIS }]);
+
+  const crisis = sharedContextData.find(c => c.key === 'crisis')?.value ?? DEV_CRISIS;
+  const totalConflicts = reasoningData.filter(r => r.hasConflict).length;
+  const avgConfidence = reasoningData.length
+    ? reasoningData.reduce((s, r) => s + Number(r.confidence), 0) / reasoningData.length : 0;
+  const liveSessionAnchor = Number(sharedContextData.find(c => c.key === 'crisis')?.updatedAt ?? tsNow());
+  const isLiveLaunched = reasoningData.length > 0 || agentsData.some(a => a.status !== 'idle');
+  const launched = DEV_MODE ? isLaunched : isLiveLaunched;
+  const sessionClock = DEV_MODE ? sessionSecs : Math.max(0, Math.floor(tsNow() - liveSessionAnchor));
+  const liveConnected = DEV_MODE ? true : connState.isActive;
+  const liveReady = DEV_MODE ? true : (liveAgentsReady && liveReasoningReady);
+  const canDispatch = DEV_MODE || liveConnected;
+  const latestByAgent = useMemo(() => {
     const out = {};
-    ['scout','strategist','devils_advocate'].forEach(id => {
-      out[id] = reasoningLog.find(r => r.agentId === id);
+    ['scout', 'strategist', 'devils_advocate'].forEach(id => {
+      out[id] = reasoningData.find(r => r.agentId === id);
     });
     return out;
-  }, [reasoningLog]);
+  }, [reasoningData]);
 
   // ── Session timer ──────────────────────────────────────────
   useEffect(() => {
@@ -349,7 +384,7 @@ export default function App() {
   // ── Auto-scroll feed to top ────────────────────────────────
   useEffect(() => {
     feedRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-  }, [reasoningLog.length]);
+  }, [reasoningData.length]);
 
   // ── DEV Simulation ─────────────────────────────────────────
   useEffect(() => {
@@ -371,7 +406,7 @@ export default function App() {
       setReasoningLog(prev => [entry, ...prev].slice(0, 30));
       setAgents(prev => prev.map(a =>
         a.agentId === agentId
-          ? { ...a, status:'idle', confidence: sample.confidence, lastUpdated: now }
+          ? { ...a, status: 'idle', confidence: sample.confidence, lastUpdated: now }
           : a
       ));
       if (msgTarget) {
@@ -397,7 +432,7 @@ export default function App() {
           if (!simActive.current) return;
           // Set thinking
           setAgents(prev => prev.map(a =>
-            a.agentId === agentId ? { ...a, status:'thinking', lastUpdated: tsNow() } : a
+            a.agentId === agentId ? { ...a, status: 'thinking', lastUpdated: tsNow() } : a
           ));
           // After think time, produce output
           const thinkMs = 3500 + Math.random() * 4000;
@@ -414,52 +449,58 @@ export default function App() {
       tick(initialDelay);
     };
 
-    cycle('scout',           1200);
-    cycle('strategist',      5500);
+    cycle('scout', 1200);
+    cycle('strategist', 5500);
     cycle('devils_advocate', 9500);
 
     return () => { simActive.current = false; };
   }, [isLaunched, isPaused]);
 
   // ── Handlers ───────────────────────────────────────────────
-  const handleLaunch = useCallback(() => {
-    setSharedContext([{ key:'crisis', value: launchCrisis }]);
-    setReasoningLog([]);
-    setAgentMessages([]);
-    setAgents(prev => prev.map(a => ({ ...a, status:'idle', confidence:0 })));
-    sessionStart.current = tsNow();
-    setSessionSecs(0);
-    setIsLaunched(false);
+  const handleLaunch = useCallback(async () => {
+    const crisisText = launchCrisis.trim() || DEV_CRISIS;
     setShowLaunch(false);
-    // Tiny delay so simulation effect re-fires cleanly
-    setTimeout(() => setIsLaunched(true), 80);
-    if (!DEV_MODE) {
-      // conn.reducers.spawnSwarm(launchCrisis);
-    }
-  }, [launchCrisis]);
 
-  const handleInject = useCallback(() => {
-    if (!injInput.trim()) return;
+    if (DEV_MODE) {
+      setSharedContext([{ key: 'crisis', value: crisisText }]);
+      setReasoningLog([]);
+      setAgentMessages([]);
+      setAgents(prev => prev.map(a => ({ ...a, status: 'idle', confidence: 0 })));
+      sessionStart.current = tsNow();
+      setSessionSecs(0);
+      setIsLaunched(false);
+      // Tiny delay so simulation effect re-fires cleanly
+      setTimeout(() => setIsLaunched(true), 80);
+      return;
+    }
+
+    try {
+      await spawnSwarm({ crisis: crisisText });
+    } catch (err) {
+      console.error('Failed to launch swarm', err);
+    }
+  }, [launchCrisis, spawnSwarm]);
+
+  const handleInject = useCallback(async () => {
+    const belief = injInput.trim();
+    if (!belief) return;
     const now = tsNow();
     if (DEV_MODE) {
       setAgentMessages(prev => [...prev, {
-        msgId: nxtMsg(), fromAgent:'human', toAgent: injAgent,
-        content: injInput.trim(), isRead: false, sentAt: now,
+        msgId: nxtMsg(), fromAgent: 'human', toAgent: injAgent,
+        content: belief, isRead: false, sentAt: now,
       }]);
     } else {
-      // conn.reducers.injectBelief({ agentId: injAgent, belief: injInput.trim() });
+      try {
+        await injectBelief({ agentId: injAgent, belief });
+      } catch (err) {
+        console.error('Failed to inject belief', err);
+        return;
+      }
     }
-    setInjections(prev => [{ agent: injAgent, text: injInput.trim(), at: now }, ...prev].slice(0, 3));
+    setInjections(prev => [{ agent: injAgent, text: belief, at: now }, ...prev].slice(0, 3));
     setInjInput('');
-  }, [injInput, injAgent]);
-
-  // ── LIVE MODE data hooks (activated when DEV_MODE = false) ──
-  // const conn = useSpacetimeDB();
-  // const { rows: _agents }   = useTable(tables.agent);
-  // const { rows: _log }      = useTable(tables.reasoning_log);
-  // const { rows: _msgs }     = useTable(tables.agent_messages);
-  // const { rows: _ctx }      = useTable(tables.shared_context);
-  // When live, replace state vars above with _agents, _log, _msgs, _ctx
+  }, [injInput, injAgent, injectBelief]);
 
   // ── Styles helpers ─────────────────────────────────────────
   const panel = (extra = {}) => ({
@@ -495,44 +536,50 @@ export default function App() {
         }}>WARROOM</h1>
 
         {/* Live dot */}
-        <div style={{ position:'relative', width:10, height:10, flexShrink:0 }}>
+        <div style={{ position: 'relative', width: 10, height: 10, flexShrink: 0 }}>
           <div className="live-ping" style={{
-            position:'absolute', inset:0, borderRadius:'50%', background:'#FF3366',
+            position: 'absolute', inset: 0, borderRadius: '50%', background: '#FF3366',
           }} />
-          <div style={{ position:'absolute', inset:0, borderRadius:'50%', background:'#FF3366' }} />
+          <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: '#FF3366' }} />
         </div>
-        <span style={{ fontFamily:'Rajdhani', fontWeight:700, fontSize:'0.7rem',
-          color:'#FF3366', letterSpacing:'0.2em', flexShrink:0 }}>LIVE</span>
+        <span style={{
+          fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.7rem',
+          color: liveConnected ? '#FF3366' : '#FFB800', letterSpacing: '0.2em', flexShrink: 0
+        }}>
+          {liveConnected ? 'LIVE' : 'SYNCING'}
+        </span>
 
         {/* Timer */}
-        <span style={{ fontFamily:'Orbitron', fontSize:'0.85rem', color:'#8892A4', flexShrink:0 }}>
-          {fmt(sessionSecs)}
+        <span style={{ fontFamily: 'Orbitron', fontSize: '0.85rem', color: '#8892A4', flexShrink: 0 }}>
+          {fmt(sessionClock)}
         </span>
 
         {/* Crisis */}
-        <div style={{ flex:1, overflow:'hidden', borderLeft:'1px solid #1E293B', paddingLeft:12 }}>
+        <div style={{ flex: 1, overflow: 'hidden', borderLeft: '1px solid #1E293B', paddingLeft: 12 }}>
           <span style={{
-            fontFamily:'Space Mono', fontSize:'0.65rem', color:'#4A5568',
-            display:'block', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+            fontFamily: 'Space Mono', fontSize: '0.65rem', color: '#4A5568',
+            display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>
             ⚡ {crisis}
           </span>
         </div>
 
         {/* Agent status mini indicators */}
-        <div style={{ display:'flex', gap:12, alignItems:'center', flexShrink:0 }}>
-          {agents.map(a => {
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexShrink: 0 }}>
+          {agentsData.map(a => {
             const cfg = AGENT_CFG[a.agentId]; if (!cfg) return null;
             const thinking = a.status === 'thinking';
             return (
-              <div key={a.agentId} style={{ display:'flex', alignItems:'center', gap:5 }}>
+              <div key={a.agentId} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                 <div className={thinking ? 'status-thinking' : ''} style={{
-                  width:7, height:7, borderRadius:'50%',
+                  width: 7, height: 7, borderRadius: '50%',
                   background: thinking ? cfg.color : '#2D3B52',
                   boxShadow: thinking ? `0 0 6px ${cfg.color}` : 'none',
                 }} />
-                <span style={{ fontFamily:'Rajdhani', fontSize:'0.7rem',
-                  color: thinking ? cfg.color : '#4A5568', fontWeight:700, letterSpacing:0.5 }}>
+                <span style={{
+                  fontFamily: 'Rajdhani', fontSize: '0.7rem',
+                  color: thinking ? cfg.color : '#4A5568', fontWeight: 700, letterSpacing: 0.5
+                }}>
                   {cfg.label.toUpperCase()}
                 </span>
               </div>
@@ -541,126 +588,144 @@ export default function App() {
         </div>
 
         {/* Buttons */}
-        <button onClick={() => setShowLaunch(true)} style={{
-          background: isLaunched ? 'rgba(255,51,102,0.08)' : 'rgba(255,51,102,0.15)',
-          border: `1px solid ${isLaunched ? '#FF336640':'#FF3366'}`,
-          color: isLaunched ? '#FF336688' : '#FF3366',
-          fontFamily:'Rajdhani', fontWeight:700, fontSize:'0.75rem',
-          letterSpacing:'0.15em', padding:'6px 14px', borderRadius:3, flexShrink:0,
+        <button onClick={() => setShowLaunch(true)} disabled={!canDispatch} style={{
+          background: launched ? 'rgba(255,51,102,0.08)' : 'rgba(255,51,102,0.15)',
+          border: `1px solid ${launched ? '#FF336640' : '#FF3366'}`,
+          color: launched ? '#FF336688' : '#FF3366',
+          fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.75rem',
+          letterSpacing: '0.15em', padding: '6px 14px', borderRadius: 3, flexShrink: 0,
+          opacity: canDispatch ? 1 : 0.45,
         }}>
-          {isLaunched ? '⟳ RELAUNCH' : '▶ LAUNCH SWARM'}
+          {launched ? '⟳ RELAUNCH' : '▶ LAUNCH SWARM'}
         </button>
-        <button onClick={() => setIsPaused(p => !p)} disabled={!isLaunched} style={{
-          background:'rgba(30,41,59,0.5)', border:'1px solid #1E293B',
+        <button onClick={() => setIsPaused(p => !p)} disabled={!DEV_MODE || !launched} style={{
+          background: 'rgba(30,41,59,0.5)', border: '1px solid #1E293B',
           color: isPaused ? '#00FF88' : '#8892A4',
-          fontFamily:'Rajdhani', fontWeight:700, fontSize:'0.75rem',
-          letterSpacing:'0.15em', padding:'6px 12px', borderRadius:3,
-          opacity: isLaunched ? 1 : 0.4, flexShrink:0,
+          fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.75rem',
+          letterSpacing: '0.15em', padding: '6px 12px', borderRadius: 3,
+          opacity: DEV_MODE && launched ? 1 : 0.4, flexShrink: 0,
         }}>
           {isPaused ? '▶ RESUME' : '⏸ PAUSE'}
         </button>
       </header>
 
       {/* ── MAIN ROW: Graph + Feed ─────────────────────────── */}
-      <div style={{ display:'grid', gridTemplateColumns:'420px 1fr', overflow:'hidden' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '420px 1fr', overflow: 'hidden' }}>
 
         {/* Agent Graph panel */}
-        <div style={{ ...panel(), borderRight:'1px solid #161B27', display:'flex', flexDirection:'column' }}>
+        <div style={{ ...panel(), borderRight: '1px solid #161B27', display: 'flex', flexDirection: 'column' }}>
           <div style={panelLabel()}>NODE GRAPH — AGENT TOPOLOGY</div>
-          <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', padding:'8px 0' }}>
-            <AgentGraph agents={agents} agentMessages={agentMessages} reasoningLog={reasoningLog} />
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '8px 0' }}>
+            <AgentGraph agents={agentsData} agentMessages={messagesData} reasoningLog={reasoningData} />
           </div>
         </div>
 
         {/* Reasoning Feed */}
-        <div style={{ ...panel(), display:'flex', flexDirection:'column' }}>
-          <div style={{ ...panelLabel(), display:'flex', alignItems:'center', gap:8 }}>
+        <div style={{ ...panel(), display: 'flex', flexDirection: 'column' }}>
+          <div style={{ ...panelLabel(), display: 'flex', alignItems: 'center', gap: 8 }}>
             <span>LIVE REASONING FEED</span>
-            <span style={{ fontFamily:'Orbitron', fontSize:'0.6rem', color:'#FF3366',
-              marginLeft:'auto' }}>
-              {reasoningLog.length} ENTRIES
+            <span style={{
+              fontFamily: 'Orbitron', fontSize: '0.6rem', color: '#FF3366',
+              marginLeft: 'auto'
+            }}>
+              {reasoningData.length} ENTRIES
             </span>
           </div>
-          <div ref={feedRef} style={{ flex:1, overflowY:'auto', padding:'10px 12px' }}>
-            {reasoningLog.length === 0 ? (
-              <div style={{ display:'flex', flexDirection:'column', alignItems:'center',
-                justifyContent:'center', height:'100%', gap:10 }}>
-                <span style={{ fontSize:'2rem' }}>🧠</span>
-                <p style={{ fontFamily:'Space Mono', fontSize:'0.68rem', color:'#4A5568',
-                  textAlign:'center' }}>
-                  {isLaunched ? 'Agents are spinning up…' : 'Launch the swarm to begin.'}
+          <div ref={feedRef} style={{ flex: 1, overflowY: 'auto', padding: '10px 12px' }}>
+            {reasoningData.length === 0 ? (
+              <div style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', height: '100%', gap: 10
+              }}>
+                <span style={{ fontSize: '2rem' }}>🧠</span>
+                <p style={{
+                  fontFamily: 'Space Mono', fontSize: '0.68rem', color: '#4A5568',
+                  textAlign: 'center'
+                }}>
+                  {!liveReady ? 'Syncing live tables…' : (launched ? 'Agents are spinning up…' : 'Launch the swarm to begin.')}
                 </p>
-                <span className="blink-cursor" style={{ color:'#4A5568', fontFamily:'Space Mono' }}>_</span>
+                <span className="blink-cursor" style={{ color: '#4A5568', fontFamily: 'Space Mono' }}>_</span>
               </div>
-            ) : reasoningLog.map(e => (
-              <ReasoningEntry key={e.logId} entry={e} sessionStart={sessionStart.current} />
+            ) : reasoningData.map(e => (
+              <ReasoningEntry key={String(e.logId)} entry={e} sessionStart={DEV_MODE ? sessionStart.current : liveSessionAnchor} />
             ))}
           </div>
         </div>
       </div>
 
       {/* ── BOTTOM ROW: Memory Cards + Session Brief ──────── */}
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 380px', overflow:'hidden',
-        borderTop:'1px solid #161B27' }}>
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr 380px', overflow: 'hidden',
+        borderTop: '1px solid #161B27'
+      }}>
 
         {/* Memory Cards */}
-        <div style={{ ...panel(), borderRight:'1px solid #161B27', display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        <div style={{ ...panel(), borderRight: '1px solid #161B27', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           <div style={panelLabel()}>AGENT MEMORY CACHE</div>
-          <div style={{ flex:1, display:'flex', gap:8, padding:'10px', overflow:'hidden' }}>
+          <div style={{ flex: 1, display: 'flex', gap: 8, padding: '10px', overflow: 'hidden' }}>
             {Object.keys(AGENT_CFG).map(id => (
-              <MemoryCard key={id} agentId={id} reasoningLog={reasoningLog} />
+              <MemoryCard key={id} agentId={id} reasoningLog={reasoningData} />
             ))}
           </div>
         </div>
 
         {/* Session Brief */}
-        <div style={{ ...panel(), display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        <div style={{ ...panel(), display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           <div style={panelLabel()}>SESSION INTELLIGENCE BRIEF</div>
-          <div style={{ flex:1, overflowY:'auto', padding:'10px 14px', display:'flex',
-            flexDirection:'column', gap:8 }}>
+          <div style={{
+            flex: 1, overflowY: 'auto', padding: '10px 14px', display: 'flex',
+            flexDirection: 'column', gap: 8
+          }}>
             {/* Crisis */}
-            <BriefRow label="CRISIS" value={crisis.slice(0,80) + (crisis.length>80?'…':'')}
+            <BriefRow label="CRISIS" value={crisis.slice(0, 80) + (crisis.length > 80 ? '…' : '')}
               valueColor="#E8EDF5" mono />
             {/* Stats row */}
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
-              <BriefRow label="FINDINGS"  value={String(reasoningLog.length)} valueColor="#00FF88" mono />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <BriefRow label="FINDINGS" value={String(reasoningData.length)} valueColor="#00FF88" mono />
               <BriefRow label="CONFLICTS" value={String(totalConflicts)}
                 valueColor={totalConflicts > 0 ? '#FF3366' : '#4A5568'} mono />
             </div>
             {/* Avg confidence */}
             <div>
-              <span style={{ fontFamily:'Rajdhani', fontSize:'0.6rem', color:'#4A5568',
-                letterSpacing:'0.15em', display:'block', marginBottom:4 }}>AVG CONFIDENCE</span>
-              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                <div style={{ flex:1, height:4, background:'#161B27', borderRadius:2, overflow:'hidden' }}>
+              <span style={{
+                fontFamily: 'Rajdhani', fontSize: '0.6rem', color: '#4A5568',
+                letterSpacing: '0.15em', display: 'block', marginBottom: 4
+              }}>AVG CONFIDENCE</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ flex: 1, height: 4, background: '#161B27', borderRadius: 2, overflow: 'hidden' }}>
                   <div className="confidence-bar-fill" style={{
-                    height:'100%', width:`${avgConfidence*100}%`,
-                    background:'linear-gradient(90deg,#00D4FF,#00FF88)', borderRadius:2,
+                    height: '100%', width: `${avgConfidence * 100}%`,
+                    background: 'linear-gradient(90deg,#00D4FF,#00FF88)', borderRadius: 2,
                   }} />
                 </div>
-                <span style={{ fontFamily:'Orbitron', fontSize:'0.65rem', color:'#E8EDF5', width:32 }}>
-                  {Math.round(avgConfidence*100)}%
+                <span style={{ fontFamily: 'Orbitron', fontSize: '0.65rem', color: '#E8EDF5', width: 32 }}>
+                  {Math.round(avgConfidence * 100)}%
                 </span>
               </div>
             </div>
             {/* Latest per agent */}
-            <BriefRow label="SCOUT INTEL"      value={latestByAgent.scout?.decision}      valueColor="#00D4FF" mono />
-            <BriefRow label="RECOMMENDATION"   value={latestByAgent.strategist?.decision}  valueColor="#FFB800" mono />
+            <BriefRow label="SCOUT INTEL" value={latestByAgent.scout?.decision} valueColor="#00D4FF" mono />
+            <BriefRow label="RECOMMENDATION" value={latestByAgent.strategist?.decision} valueColor="#FFB800" mono />
             <BriefRow label="ACTIVE CHALLENGE" value={latestByAgent.devils_advocate?.decision} valueColor="#FF3366" mono />
           </div>
         </div>
       </div>
 
       {/* ── HUMAN INTERVENTION ROW ─────────────────────────── */}
-      <div style={{ ...panel(), display:'flex', alignItems:'center', gap:10, padding:'0 16px',
-        borderTop:'1px solid #161B27' }}>
-        <span style={{ fontFamily:'Rajdhani', fontWeight:700, fontSize:'0.65rem',
-          color:'#4A5568', letterSpacing:'0.15em', flexShrink:0 }}>INJECT BELIEF</span>
+      <div style={{
+        ...panel(), display: 'flex', alignItems: 'center', gap: 10, padding: '0 16px',
+        borderTop: '1px solid #161B27'
+      }}>
+        <span style={{
+          fontFamily: 'Rajdhani', fontWeight: 700, fontSize: '0.65rem',
+          color: '#4A5568', letterSpacing: '0.15em', flexShrink: 0
+        }}>INJECT BELIEF</span>
 
-        <select value={injAgent} onChange={e => setInjAgent(e.target.value)} style={{
-          background:'#080B14', border:'1px solid #1E293B', color:'#8892A4',
-          fontFamily:'Rajdhani', fontWeight:600, fontSize:'0.75rem',
-          padding:'5px 10px', borderRadius:3, flexShrink:0,
+        <select value={injAgent} disabled={!canDispatch} onChange={e => setInjAgent(e.target.value)} style={{
+          background: '#080B14', border: '1px solid #1E293B', color: '#8892A4',
+          fontFamily: 'Rajdhani', fontWeight: 600, fontSize: '0.75rem',
+          padding: '5px 10px', borderRadius: 3, flexShrink: 0,
+          opacity: canDispatch ? 1 : 0.45,
         }}>
           <option value="scout">Scout</option>
           <option value="strategist">Strategist</option>
@@ -668,41 +733,46 @@ export default function App() {
         </select>
 
         <input
+          disabled={!canDispatch}
           value={injInput} onChange={e => setInjInput(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleInject()}
           placeholder="Inject a belief or instruction into an agent…"
           style={{
-            flex:1, background:'#080B14', border:'1px solid #1E293B',
-            color:'#E8EDF5', fontFamily:'Space Mono', fontSize:'0.65rem',
-            padding:'6px 12px', borderRadius:3, outline:'none',
+            flex: 1, background: '#080B14', border: '1px solid #1E293B',
+            color: '#E8EDF5', fontFamily: 'Space Mono', fontSize: '0.65rem',
+            padding: '6px 12px', borderRadius: 3, outline: 'none',
+            opacity: canDispatch ? 1 : 0.45,
           }}
         />
 
-        <button onClick={handleInject} style={{
-          background:'rgba(0,212,255,0.1)', border:'1px solid #00D4FF40',
-          color:'#00D4FF', fontFamily:'Rajdhani', fontWeight:700,
-          fontSize:'0.7rem', letterSpacing:'0.1em', padding:'6px 14px', borderRadius:3, flexShrink:0,
+        <button onClick={handleInject} disabled={!canDispatch} style={{
+          background: 'rgba(0,212,255,0.1)', border: '1px solid #00D4FF40',
+          color: '#00D4FF', fontFamily: 'Rajdhani', fontWeight: 700,
+          fontSize: '0.7rem', letterSpacing: '0.1em', padding: '6px 14px', borderRadius: 3, flexShrink: 0,
+          opacity: canDispatch ? 1 : 0.45,
         }}>INJECT</button>
 
         {/* Last injections */}
-        <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           {injections.map((inj, i) => {
             const c = AGENT_CFG[inj.agent]?.color ?? '#8892A4';
             return (
               <span key={i} style={{
-                background: `${c}15`, border:`1px solid ${c}40`,
-                color: c, fontFamily:'Rajdhani', fontSize:'0.65rem',
-                padding:'2px 8px', borderRadius:2, maxWidth:120,
-                overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+                background: `${c}15`, border: `1px solid ${c}40`,
+                color: c, fontFamily: 'Rajdhani', fontSize: '0.65rem',
+                padding: '2px 8px', borderRadius: 2, maxWidth: 120,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               }} title={inj.text}>
-                {AGENT_CFG[inj.agent]?.emoji} {inj.text.slice(0,18)}{inj.text.length>18?'…':''}
+                {AGENT_CFG[inj.agent]?.emoji} {inj.text.slice(0, 18)}{inj.text.length > 18 ? '…' : ''}
               </span>
             );
           })}
         </div>
 
-        <span style={{ fontFamily:'Space Mono', fontSize:'0.58rem', color:'#2D3B52',
-          flexShrink:0, fontStyle:'italic' }}>
+        <span style={{
+          fontFamily: 'Space Mono', fontSize: '0.58rem', color: '#2D3B52',
+          flexShrink: 0, fontStyle: 'italic'
+        }}>
           Picked up on next think cycle
         </span>
       </div>
@@ -710,18 +780,20 @@ export default function App() {
       {/* ── LAUNCH MODAL ───────────────────────────────────── */}
       {showLaunch && (
         <div style={{
-          position:'fixed', inset:0, background:'rgba(8,11,20,0.88)',
-          display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000,
-          backdropFilter:'blur(4px)',
+          position: 'fixed', inset: 0, background: 'rgba(8,11,20,0.88)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+          backdropFilter: 'blur(4px)',
         }} onClick={() => setShowLaunch(false)}>
           <div onClick={e => e.stopPropagation()} style={{
-            background:'#0D1117', border:'1px solid #1E293B',
-            borderTop:'3px solid #FF3366', borderRadius:6,
-            padding:'28px 32px', width:560, display:'flex', flexDirection:'column', gap:16,
+            background: '#0D1117', border: '1px solid #1E293B',
+            borderTop: '3px solid #FF3366', borderRadius: 6,
+            padding: '28px 32px', width: 560, display: 'flex', flexDirection: 'column', gap: 16,
           }}>
-            <h2 style={{ fontFamily:'Orbitron', fontWeight:700, fontSize:'1.1rem',
-              color:'#E8EDF5', letterSpacing:'0.2em' }}>LAUNCH SWARM</h2>
-            <p style={{ fontFamily:'Rajdhani', fontSize:'0.8rem', color:'#8892A4' }}>
+            <h2 style={{
+              fontFamily: 'Orbitron', fontWeight: 700, fontSize: '1.1rem',
+              color: '#E8EDF5', letterSpacing: '0.2em'
+            }}>LAUNCH SWARM</h2>
+            <p style={{ fontFamily: 'Rajdhani', fontSize: '0.8rem', color: '#8892A4' }}>
               Define the crisis scenario. All three agents will begin thinking in parallel.
             </p>
             <textarea
@@ -729,22 +801,22 @@ export default function App() {
               onChange={e => setLaunchCrisis(e.target.value)}
               rows={4}
               style={{
-                background:'#080B14', border:'1px solid #1E293B',
-                color:'#E8EDF5', fontFamily:'Space Mono', fontSize:'0.68rem',
-                padding:'12px', borderRadius:4, resize:'vertical', outline:'none',
-                lineHeight:1.7,
+                background: '#080B14', border: '1px solid #1E293B',
+                color: '#E8EDF5', fontFamily: 'Space Mono', fontSize: '0.68rem',
+                padding: '12px', borderRadius: 4, resize: 'vertical', outline: 'none',
+                lineHeight: 1.7,
               }}
             />
-            <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
               <button onClick={() => setShowLaunch(false)} style={{
-                background:'transparent', border:'1px solid #1E293B',
-                color:'#4A5568', fontFamily:'Rajdhani', fontWeight:700,
-                fontSize:'0.75rem', letterSpacing:'0.1em', padding:'8px 18px', borderRadius:3,
+                background: 'transparent', border: '1px solid #1E293B',
+                color: '#4A5568', fontFamily: 'Rajdhani', fontWeight: 700,
+                fontSize: '0.75rem', letterSpacing: '0.1em', padding: '8px 18px', borderRadius: 3,
               }}>CANCEL</button>
               <button onClick={handleLaunch} style={{
-                background:'rgba(255,51,102,0.15)', border:'1px solid #FF3366',
-                color:'#FF3366', fontFamily:'Rajdhani', fontWeight:700,
-                fontSize:'0.75rem', letterSpacing:'0.15em', padding:'8px 22px', borderRadius:3,
+                background: 'rgba(255,51,102,0.15)', border: '1px solid #FF3366',
+                color: '#FF3366', fontFamily: 'Rajdhani', fontWeight: 700,
+                fontSize: '0.75rem', letterSpacing: '0.15em', padding: '8px 22px', borderRadius: 3,
               }}>▶ LAUNCH</button>
             </div>
           </div>
@@ -758,14 +830,16 @@ export default function App() {
 function BriefRow({ label, value, valueColor = '#E8EDF5', mono = false }) {
   return (
     <div>
-      <span style={{ fontFamily:'Rajdhani', fontSize:'0.58rem', color:'#4A5568',
-        letterSpacing:'0.15em', display:'block', marginBottom:2 }}>{label}</span>
+      <span style={{
+        fontFamily: 'Rajdhani', fontSize: '0.58rem', color: '#4A5568',
+        letterSpacing: '0.15em', display: 'block', marginBottom: 2
+      }}>{label}</span>
       <span style={{
         fontFamily: mono ? 'Space Mono' : 'Rajdhani',
         fontSize: mono ? '0.65rem' : '0.75rem',
         color: value ? valueColor : '#2D3B52',
-        lineHeight:1.5, display:'block',
-        overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+        lineHeight: 1.5, display: 'block',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
         {value ?? '— awaiting data'}
       </span>

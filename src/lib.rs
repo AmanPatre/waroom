@@ -18,19 +18,26 @@ const MEM0_API_KEY:   &str = env!("MEM0_API_KEY",   "Missing env var: MEM0_API_K
 const GEMINI_URL:     &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent";
 const MEM0_SEARCH_URL: &str = "https://api.mem0.ai/v1/memories/search";
 const MEM0_ADD_URL:    &str = "https://api.mem0.ai/v1/memories";
+const THINK_INTERVAL_SECS: u64 = 30;
 
 // =============================================================================
-// HELPER — unix timestamp in seconds
+// HELPER — unix timestamp conversion in seconds
 // =============================================================================
 
-/// Returns the current Unix timestamp in seconds.
-/// Used everywhere instead of repeating SystemTime boilerplate.
-fn current_timestamp_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+fn timestamp_micros_to_secs(micros: i64) -> u64 {
+    if micros <= 0 {
+        0
+    } else {
+        (micros as u64) / 1_000_000
+    }
+}
+
+fn reducer_now_secs(ctx: &ReducerContext) -> u64 {
+    timestamp_micros_to_secs(ctx.timestamp.to_micros_since_unix_epoch())
+}
+
+fn procedure_now_secs(ctx: &ProcedureContext) -> u64 {
+    timestamp_micros_to_secs(ctx.timestamp.to_micros_since_unix_epoch())
 }
 
 // =============================================================================
@@ -160,7 +167,7 @@ pub struct DevilsSchedule {
 
 #[reducer(init)]
 pub fn init(ctx: &ReducerContext) {
-    let now = current_timestamp_secs();
+    let now = reducer_now_secs(ctx);
 
     // -------------------------------------------------------------------------
     // Insert the three autonomous agents
@@ -205,7 +212,7 @@ pub fn init(ctx: &ReducerContext) {
     // -------------------------------------------------------------------------
     // Schedule each agent's first cycle to fire in 30 seconds
     // -------------------------------------------------------------------------
-    let interval = ScheduleAt::from(Duration::from_secs(30));
+    let interval = ScheduleAt::from(Duration::from_secs(THINK_INTERVAL_SECS));
 
     ctx.db.scout_schedule().insert(ScoutSchedule {
         scheduled_id: 0,
@@ -233,7 +240,7 @@ pub fn init(ctx: &ReducerContext) {
 
 #[reducer]
 pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
-    let now = current_timestamp_secs();
+    let now = reducer_now_secs(ctx);
 
     // Delete-then-reinsert pattern for primary-key upsert
     ctx.db.shared_context().key().delete("crisis".to_string());
@@ -279,13 +286,14 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
 
 #[reducer]
 pub fn inject_belief(ctx: &ReducerContext, agent_id: String, belief: String) {
+    let now = reducer_now_secs(ctx);
     ctx.db.agent_messages().insert(AgentMessage {
         msg_id:     0,
         from_agent: "human".to_string(),
         to_agent:   agent_id.clone(),
         content:    belief,
         is_read:    false,
-        sent_at:    current_timestamp_secs(),
+        sent_at:    now,
     });
 
     log::info!("[warroom] belief injected for agent: {}", agent_id);
@@ -314,7 +322,7 @@ pub fn mark_read(ctx: &ReducerContext, msg_id: u64) {
 
 #[reducer]
 pub fn update_agent_status(ctx: &ReducerContext, agent_id: String, status: String) {
-    let now = current_timestamp_secs();
+    let now = reducer_now_secs(ctx);
     if let Some(agent) = ctx.db.agent().agent_id().find(&agent_id) {
         let updated = Agent {
             status,
@@ -379,6 +387,115 @@ fn extract_gemini_text(raw: &str) -> Option<String> {
     Some(text)
 }
 
+fn set_agent_state(
+    ctx: &mut ProcedureContext,
+    agent_id: &str,
+    status: &str,
+    current_task: &str,
+    confidence: Option<f32>,
+) {
+    let now = procedure_now_secs(ctx);
+    ctx.with_tx(|tx_ctx| {
+        if let Some(agent) = tx_ctx.db.agent().agent_id().find(agent_id.to_owned()) {
+            let updated = Agent {
+                status: status.to_string(),
+                current_task: current_task.to_string(),
+                confidence: confidence.unwrap_or(agent.confidence),
+                last_updated: now,
+                ..agent
+            };
+            tx_ctx.db.agent().agent_id().delete(agent_id.to_owned());
+            tx_ctx.db.agent().insert(updated);
+        }
+    });
+}
+
+fn append_failure_log(ctx: &mut ProcedureContext, agent_id: &str, reason: &str) {
+    let now = procedure_now_secs(ctx);
+    ctx.with_tx(|tx_ctx| {
+        tx_ctx.db.reasoning_log().insert(ReasoningLog {
+            log_id: 0,
+            agent_id: agent_id.to_string(),
+            reasoning: reason.to_string(),
+            decision: String::new(),
+            confidence: 0.0,
+            has_conflict: false,
+            timestamp: now,
+        });
+    });
+}
+
+fn latest_decision_for_agent(ctx: &mut ProcedureContext, agent_id: &str) -> Option<String> {
+    ctx.with_tx(|tx_ctx| {
+        tx_ctx
+            .db
+            .reasoning_log()
+            .iter()
+            .filter(|r| r.agent_id == agent_id)
+            .max_by_key(|r| r.timestamp)
+            .map(|r| r.decision)
+    })
+}
+
+fn has_any_term(text: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|t| text.contains(t))
+}
+
+fn evaluate_conflict(
+    strategist_decision: &str,
+    devils_decision: &str,
+    devils_reasoning: &str,
+    llm_conflict: bool,
+    confidence: f32,
+) -> bool {
+    if llm_conflict {
+        return true;
+    }
+
+    let strategist = strategist_decision.to_ascii_lowercase();
+    let devils = format!("{} {}", devils_decision, devils_reasoning).to_ascii_lowercase();
+
+    let strategist_action = has_any_term(
+        &strategist,
+        &[
+            "launch",
+            "execute",
+            "proceed",
+            "roll out",
+            "discount",
+            "invest",
+            "ship",
+            "respond",
+            "adopt",
+        ],
+    );
+
+    let devils_rejection = has_any_term(
+        &devils,
+        &[
+            "do not",
+            "don't",
+            "avoid",
+            "reject",
+            "block",
+            "oppose",
+            "pause",
+            "delay",
+            "catastrophic",
+            "fatal flaw",
+            "unsafe",
+            "too risky",
+        ],
+    );
+
+    let high_severity_risk = has_any_term(
+        &devils,
+        &["critical flaw", "major risk", "severe risk", "existential"],
+    );
+
+    (strategist_action && devils_rejection) || (high_severity_risk && confidence >= 0.65)
+}
+
 // =============================================================================
 // PROCEDURE: scout_think
 // Fires every 30 seconds via ScoutSchedule.
@@ -389,6 +506,13 @@ fn extract_gemini_text(raw: &str) -> Option<String> {
 #[spacetimedb::procedure]
 fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     log::info!("[scout] think cycle starting");
+    set_agent_state(
+        ctx,
+        "scout",
+        "thinking",
+        "Gathering crisis intelligence",
+        None,
+    );
 
     // -------------------------------------------------------------------------
     // STEP 1 — Read current state from the database
@@ -493,18 +617,8 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
         Ok(resp) => resp.into_parts().1.into_string_lossy(),
         Err(e) => {
             log::error!("[scout] Gemini call failed: {:?}", e);
-            // Gracefully write a failure log entry and bail
-            ctx.with_tx(|tx_ctx| {
-                tx_ctx.db.reasoning_log().insert(ReasoningLog {
-                    log_id:       0,
-                    agent_id:     "scout".to_string(),
-                    reasoning:    "API call failed".to_string(),
-                    decision:     String::new(),
-                    confidence:   0.0,
-                    has_conflict: false,
-                    timestamp:    current_timestamp_secs(),
-                });
-            });
+            append_failure_log(ctx, "scout", "Gemini API call failed");
+            set_agent_state(ctx, "scout", "error", "Gemini API call failed", Some(0.0));
             return;
         }
     };
@@ -512,17 +626,37 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     // STEP 4 — Parse Gemini response
     // -------------------------------------------------------------------------
-    let parsed_text = extract_gemini_text(&gemini_raw).unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&parsed_text).unwrap_or_else(|e| {
-        log::error!("[scout] JSON parse error: {:?}", e);
-        serde_json::json!({
-            "reasoning": "Failed to parse Gemini response",
-            "decision": "",
-            "confidence": 0.0,
-            "memory_to_store": "",
-            "message_to_strategist": ""
-        })
-    });
+    let parsed_text = match extract_gemini_text(&gemini_raw) {
+        Some(text) => text,
+        None => {
+            log::error!("[scout] Failed to extract Gemini text payload");
+            append_failure_log(ctx, "scout", "Failed to extract Gemini text payload");
+            set_agent_state(
+                ctx,
+                "scout",
+                "error",
+                "Failed to extract Gemini text payload",
+                Some(0.0),
+            );
+            return;
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&parsed_text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[scout] JSON parse error: {:?}", e);
+            append_failure_log(ctx, "scout", "Failed to parse Gemini response");
+            set_agent_state(
+                ctx,
+                "scout",
+                "error",
+                "Failed to parse Gemini response",
+                Some(0.0),
+            );
+            return;
+        }
+    };
 
     let reasoning            = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision             = parsed["decision"].as_str().unwrap_or("").to_string();
@@ -551,9 +685,8 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     // STEP 6 — Persist results to the database
     // -------------------------------------------------------------------------
+    let now = procedure_now_secs(ctx);
     ctx.with_tx(|tx_ctx| {
-        let now = current_timestamp_secs();
-
         // Append reasoning log entry
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id:       0,
@@ -577,18 +710,15 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
             });
         }
 
-        // Update agent status back to idle with latest confidence
-        if let Some(agent) = tx_ctx.db.agent().agent_id().find("scout".to_owned()) {
-            let updated = Agent {
-                status:       "idle".to_string(),
-                confidence,
-                last_updated: now,
-                ..agent
-            };
-            tx_ctx.db.agent().agent_id().delete("scout".to_owned());
-            tx_ctx.db.agent().insert(updated);
-        }
     });
+
+    set_agent_state(
+        ctx,
+        "scout",
+        "idle",
+        "Awaiting next intelligence cycle",
+        Some(confidence),
+    );
 
     log::info!("[scout] think cycle complete — confidence: {:.2}", confidence);
 }
@@ -603,6 +733,13 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
 #[spacetimedb::procedure]
 fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     log::info!("[strategist] think cycle starting");
+    set_agent_state(
+        ctx,
+        "strategist",
+        "thinking",
+        "Synthesizing recommendation",
+        None,
+    );
 
     // -------------------------------------------------------------------------
     // STEP 1 — Read state
@@ -701,17 +838,14 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
         Ok(resp) => resp.into_parts().1.into_string_lossy(),
         Err(e) => {
             log::error!("[strategist] Gemini call failed: {:?}", e);
-            ctx.with_tx(|tx_ctx| {
-                tx_ctx.db.reasoning_log().insert(ReasoningLog {
-                    log_id:       0,
-                    agent_id:     "strategist".to_string(),
-                    reasoning:    "API call failed".to_string(),
-                    decision:     String::new(),
-                    confidence:   0.0,
-                    has_conflict: false,
-                    timestamp:    current_timestamp_secs(),
-                });
-            });
+            append_failure_log(ctx, "strategist", "Gemini API call failed");
+            set_agent_state(
+                ctx,
+                "strategist",
+                "error",
+                "Gemini API call failed",
+                Some(0.0),
+            );
             return;
         }
     };
@@ -719,17 +853,37 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     // -------------------------------------------------------------------------
     // STEP 4 — Parse Gemini response
     // -------------------------------------------------------------------------
-    let parsed_text = extract_gemini_text(&gemini_raw).unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&parsed_text).unwrap_or_else(|e| {
-        log::error!("[strategist] JSON parse error: {:?}", e);
-        serde_json::json!({
-            "reasoning": "Failed to parse Gemini response",
-            "decision": "",
-            "confidence": 0.0,
-            "memory_to_store": "",
-            "message_to_devils_advocate": ""
-        })
-    });
+    let parsed_text = match extract_gemini_text(&gemini_raw) {
+        Some(text) => text,
+        None => {
+            log::error!("[strategist] Failed to extract Gemini text payload");
+            append_failure_log(ctx, "strategist", "Failed to extract Gemini text payload");
+            set_agent_state(
+                ctx,
+                "strategist",
+                "error",
+                "Failed to extract Gemini text payload",
+                Some(0.0),
+            );
+            return;
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&parsed_text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[strategist] JSON parse error: {:?}", e);
+            append_failure_log(ctx, "strategist", "Failed to parse Gemini response");
+            set_agent_state(
+                ctx,
+                "strategist",
+                "error",
+                "Failed to parse Gemini response",
+                Some(0.0),
+            );
+            return;
+        }
+    };
 
     let reasoning                 = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision                  = parsed["decision"].as_str().unwrap_or("").to_string();
@@ -758,9 +912,8 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     // -------------------------------------------------------------------------
     // STEP 6 — Persist results
     // -------------------------------------------------------------------------
+    let now = procedure_now_secs(ctx);
     ctx.with_tx(|tx_ctx| {
-        let now = current_timestamp_secs();
-
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id:       0,
             agent_id:     "strategist".to_string(),
@@ -782,17 +935,15 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
             });
         }
 
-        if let Some(agent) = tx_ctx.db.agent().agent_id().find("strategist".to_owned()) {
-            let updated = Agent {
-                status:       "idle".to_string(),
-                confidence,
-                last_updated: now,
-                ..agent
-            };
-            tx_ctx.db.agent().agent_id().delete("strategist".to_owned());
-            tx_ctx.db.agent().insert(updated);
-        }
     });
+
+    set_agent_state(
+        ctx,
+        "strategist",
+        "idle",
+        "Awaiting next strategy cycle",
+        Some(confidence),
+    );
 
     log::info!("[strategist] think cycle complete — confidence: {:.2}", confidence);
 }
@@ -807,6 +958,13 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
 #[spacetimedb::procedure]
 fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     log::info!("[devils_advocate] think cycle starting");
+    set_agent_state(
+        ctx,
+        "devils_advocate",
+        "thinking",
+        "Stress-testing strategist recommendation",
+        None,
+    );
 
     // -------------------------------------------------------------------------
     // STEP 1 — Read state
@@ -905,17 +1063,14 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
         Ok(resp) => resp.into_parts().1.into_string_lossy(),
         Err(e) => {
             log::error!("[devils_advocate] Gemini call failed: {:?}", e);
-            ctx.with_tx(|tx_ctx| {
-                tx_ctx.db.reasoning_log().insert(ReasoningLog {
-                    log_id:       0,
-                    agent_id:     "devils_advocate".to_string(),
-                    reasoning:    "API call failed".to_string(),
-                    decision:     String::new(),
-                    confidence:   0.0,
-                    has_conflict: false,
-                    timestamp:    current_timestamp_secs(),
-                });
-            });
+            append_failure_log(ctx, "devils_advocate", "Gemini API call failed");
+            set_agent_state(
+                ctx,
+                "devils_advocate",
+                "error",
+                "Gemini API call failed",
+                Some(0.0),
+            );
             return;
         }
     };
@@ -923,26 +1078,57 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     // STEP 4 — Parse Gemini response
     // -------------------------------------------------------------------------
-    let parsed_text = extract_gemini_text(&gemini_raw).unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&parsed_text).unwrap_or_else(|e| {
-        log::error!("[devils_advocate] JSON parse error: {:?}", e);
-        serde_json::json!({
-            "reasoning": "Failed to parse Gemini response",
-            "decision": "",
-            "confidence": 0.0,
-            "memory_to_store": "",
-            "has_conflict": false,
-            "challenge_to_strategist": ""
-        })
-    });
+    let parsed_text = match extract_gemini_text(&gemini_raw) {
+        Some(text) => text,
+        None => {
+            log::error!("[devils_advocate] Failed to extract Gemini text payload");
+            append_failure_log(
+                ctx,
+                "devils_advocate",
+                "Failed to extract Gemini text payload",
+            );
+            set_agent_state(
+                ctx,
+                "devils_advocate",
+                "error",
+                "Failed to extract Gemini text payload",
+                Some(0.0),
+            );
+            return;
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&parsed_text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[devils_advocate] JSON parse error: {:?}", e);
+            append_failure_log(ctx, "devils_advocate", "Failed to parse Gemini response");
+            set_agent_state(
+                ctx,
+                "devils_advocate",
+                "error",
+                "Failed to parse Gemini response",
+                Some(0.0),
+            );
+            return;
+        }
+    };
 
     let reasoning              = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision               = parsed["decision"].as_str().unwrap_or("").to_string();
     let confidence             = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
     let memory_to_store        = parsed["memory_to_store"].as_str().unwrap_or("").to_string();
-    // has_conflict comes directly from the LLM — Devil's Advocate controls this flag
-    let has_conflict           = parsed["has_conflict"].as_bool().unwrap_or(false);
+    let llm_has_conflict        = parsed["has_conflict"].as_bool().unwrap_or(false);
     let challenge_to_strategist = parsed["challenge_to_strategist"].as_str().unwrap_or("").to_string();
+
+    let latest_strategist_decision = latest_decision_for_agent(ctx, "strategist").unwrap_or_default();
+    let has_conflict = evaluate_conflict(
+        &latest_strategist_decision,
+        &decision,
+        &reasoning,
+        llm_has_conflict,
+        confidence,
+    );
 
     // -------------------------------------------------------------------------
     // STEP 5 — Store memory in Mem0
@@ -965,9 +1151,8 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     // STEP 6 — Persist results (including the LLM-controlled has_conflict flag)
     // -------------------------------------------------------------------------
+    let now = procedure_now_secs(ctx);
     ctx.with_tx(|tx_ctx| {
-        let now = current_timestamp_secs();
-
         // Log entry — note has_conflict is set from the parsed LLM response
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id: 0,
@@ -991,18 +1176,15 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
             });
         }
 
-        // Update agent status
-        if let Some(agent) = tx_ctx.db.agent().agent_id().find("devils_advocate".to_owned()) {
-            let updated = Agent {
-                status:       "idle".to_string(),
-                confidence,
-                last_updated: now,
-                ..agent
-            };
-            tx_ctx.db.agent().agent_id().delete("devils_advocate".to_owned());
-            tx_ctx.db.agent().insert(updated);
-        }
     });
+
+    set_agent_state(
+        ctx,
+        "devils_advocate",
+        "idle",
+        "Awaiting next critical review cycle",
+        Some(confidence),
+    );
 
     log::info!(
         "[devils_advocate] think cycle complete — confidence: {:.2}, conflict: {}",
