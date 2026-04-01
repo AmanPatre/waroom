@@ -2,7 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App.jsx';
 import './App.css';
-import { DbConnection } from './module_bindings/index.js';
+import { DbConnection } from './module_bindings/index';
 import { SpacetimeDBProvider } from 'spacetimedb/react';
 
 // ─────────────────────────────────────────────
@@ -43,10 +43,35 @@ if (DEV_MODE) {
         .subscribeToAllTables();
     });
   
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, errorInfo) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return <div style={{ color:'white', background:'black', padding: '2rem', fontFamily: 'monospace' }}>
+        <h2>Dashboard Crashed!</h2>
+        <pre style={{color:'red'}}>{this.state.error && this.state.error.toString()}</pre>
+        <pre>{this.state.error && this.state.error.stack}</pre>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
+
   ReactDOM.createRoot(document.getElementById('root')).render(
     <React.StrictMode>
       <SpacetimeDBProvider connectionBuilder={connectionBuilder}>
-        <App />
+        <ErrorBoundary>
+          <App />
+        </ErrorBoundary>
       </SpacetimeDBProvider>
     </React.StrictMode>
   );

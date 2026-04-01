@@ -1,0 +1,34 @@
+    Checking warroom v0.1.0 (E:\SpaceTime Db)
+error[E0425]: cannot find value `now` in this scope
+   --> src\lib.rs:510:35
+    |
+510 |                     timestamp:    now,
+    |                                   ^^^ not found in this scope
+System.Management.Automation.RemoteException
+error[E0425]: cannot find value `now` in this scope
+   --> src\lib.rs:718:35
+    |
+718 |                     timestamp:    now,
+    |                                   ^^^ not found in this scope
+System.Management.Automation.RemoteException
+error[E0502]: cannot borrow `*ctx` as mutable because it is also borrowed as immutable
+   --> src\lib.rs:915:13
+    |
+915 |               ctx.with_tx(|tx_ctx| {
+    |               ^   ------- -------- immutable borrow occurs here
+    |               |   |
+    |  _____________|   immutable borrow later used by call
+    | |
+916 | |                 tx_ctx.db.reasoning_log().insert(ReasoningLog {
+917 | |                     log_id:       0,
+918 | |                     agent_id:     "devils_advocate".to_string(),
+...   |
+923 | |                     timestamp:    get_timestamp_secs(ctx.timestamp),
+    | |                                                      ------------- first borrow occurs due to use of `ctx.timestamp` in closure
+924 | |                 });
+925 | |             });
+    | |______________^ mutable borrow occurs here
+System.Management.Automation.RemoteException
+Some errors have detailed explanations: E0425, E0502.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `warroom` (lib) due to 3 previous errors

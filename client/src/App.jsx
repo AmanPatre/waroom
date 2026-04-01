@@ -73,11 +73,11 @@ let _mid = 10; const nxtMsg = () => ++_mid;
 // ============================================================
 function AgentGraph({ agents, agentMessages, reasoningLog }) {
   const now = tsNow();
-  const recentMsgs = agentMessages.filter(m => now - m.sentAt < 12);
+  const recentMsgs = agentMessages.filter(m => now - Number(m.sentAt) < 12);
 
   const latestDevils = useMemo(() =>
     [...reasoningLog].filter(r => r.agentId === 'devils_advocate')
-      .sort((a,b) => b.timestamp - a.timestamp)[0],
+      .sort((a,b) => Number(b.timestamp) - Number(a.timestamp))[0],
   [reasoningLog]);
   const isConflict = latestDevils?.hasConflict ?? false;
 
@@ -197,7 +197,7 @@ function AgentGraph({ agents, agentMessages, reasoningLog }) {
 // ============================================================
 function ReasoningEntry({ entry, sessionStart }) {
   const cfg = AGENT_CFG[entry.agentId] ?? { color: '#8892A4', label: entry.agentId };
-  const elapsed = Math.max(0, Math.round(entry.timestamp - sessionStart));
+  const elapsed = Math.max(0, Math.round(Number(entry.timestamp) - sessionStart));
 
   return (
     <div className="reasoning-entry" style={{
@@ -311,10 +311,27 @@ function MemoryCard({ agentId, reasoningLog }) {
 // ============================================================
 export default function App() {
   // ── State ──────────────────────────────────────────────────
-  const [agents,        setAgents]        = useState(INITIAL_AGENTS);
-  const [reasoningLog,  setReasoningLog]  = useState([]);
-  const [agentMessages, setAgentMessages] = useState([]);
-  const [sharedContext, setSharedContext] = useState([{ key:'crisis', value: DEV_CRISIS }]);
+  // ── LIVE MODE SpacetimeDB Hooks ─────────────────────────────
+  const conn = useSpacetimeDB();
+  const [_agents] = useTable(tables.agent);
+  const [_log]    = useTable(tables.reasoning_log);
+  const [_msgs]   = useTable(tables.agent_messages);
+  const [_ctx]    = useTable(tables.shared_context);
+
+  const agents        = _agents ? [..._agents] : INITIAL_AGENTS;
+  const reasoningLog  = _log ? [..._log].sort((a,b) => Number(b.timestamp) - Number(a.timestamp)) : [];
+  const agentMessages = _msgs ? [..._msgs] : [];
+  const sharedContext = _ctx ? [..._ctx] : [{ key:'crisis', value: DEV_CRISIS }];
+
+  // ── LIVE MODE Reducers ──────────────────────────────────────
+  const spawnSwarm = useReducer(reducers.spawnSwarm);
+  const injectBelief = useReducer(reducers.injectBelief);
+
+  // ── Legacy DEV hooks (Disabled by false DEV_MODE) ──────────
+  const [devAgents,        setAgents]        = useState(INITIAL_AGENTS);
+  const [devReasoningLog,  setReasoningLog]  = useState([]);
+  const [devAgentMessages, setAgentMessages] = useState([]);
+  const [devSharedContext, setSharedContext] = useState([{ key:'crisis', value: DEV_CRISIS }]);
   const [sessionSecs,   setSessionSecs]   = useState(0);
   const [isPaused,      setIsPaused]      = useState(false);
   const [isLaunched,    setIsLaunched]    = useState(false);
@@ -329,6 +346,7 @@ export default function App() {
 
   // ── Derived ────────────────────────────────────────────────
   const crisis = sharedContext.find(c => c.key === 'crisis')?.value ?? DEV_CRISIS;
+  const finalBrief = sharedContext.find(c => c.key === 'final_brief')?.value;
   const totalConflicts   = reasoningLog.filter(r => r.hasConflict).length;
   const avgConfidence    = reasoningLog.length
     ? reasoningLog.reduce((s, r) => s + r.confidence, 0) / reasoningLog.length : 0;
@@ -434,10 +452,9 @@ export default function App() {
     // Tiny delay so simulation effect re-fires cleanly
     setTimeout(() => setIsLaunched(true), 80);
     if (!DEV_MODE) {
-      // conn.reducers.spawnSwarm(launchCrisis);
+      spawnSwarm(launchCrisis);
     }
-  }, [launchCrisis]);
-
+  }, [launchCrisis, spawnSwarm]);
   const handleInject = useCallback(() => {
     if (!injInput.trim()) return;
     const now = tsNow();
@@ -447,19 +464,18 @@ export default function App() {
         content: injInput.trim(), isRead: false, sentAt: now,
       }]);
     } else {
-      // conn.reducers.injectBelief({ agentId: injAgent, belief: injInput.trim() });
+      injectBelief(injAgent, injInput.trim());
     }
     setInjections(prev => [{ agent: injAgent, text: injInput.trim(), at: now }, ...prev].slice(0, 3));
     setInjInput('');
-  }, [injInput, injAgent]);
+  }, [injInput, injAgent, injectBelief]);
+
+  const handleTogglePause = useCallback(() => {
+    if (DEV_MODE) setIsPaused(p => !p);
+  }, []);
 
   // ── LIVE MODE data hooks (activated when DEV_MODE = false) ──
-  // const conn = useSpacetimeDB();
-  // const { rows: _agents }   = useTable(tables.agent);
-  // const { rows: _log }      = useTable(tables.reasoning_log);
-  // const { rows: _msgs }     = useTable(tables.agent_messages);
-  // const { rows: _ctx }      = useTable(tables.shared_context);
-  // When live, replace state vars above with _agents, _log, _msgs, _ctx
+  // Replaced with actual useTable hooks at top of component.
 
   // ── Styles helpers ─────────────────────────────────────────
   const panel = (extra = {}) => ({
@@ -550,15 +566,7 @@ export default function App() {
         }}>
           {isLaunched ? '⟳ RELAUNCH' : '▶ LAUNCH SWARM'}
         </button>
-        <button onClick={() => setIsPaused(p => !p)} disabled={!isLaunched} style={{
-          background:'rgba(30,41,59,0.5)', border:'1px solid #1E293B',
-          color: isPaused ? '#00FF88' : '#8892A4',
-          fontFamily:'Rajdhani', fontWeight:700, fontSize:'0.75rem',
-          letterSpacing:'0.15em', padding:'6px 12px', borderRadius:3,
-          opacity: isLaunched ? 1 : 0.4, flexShrink:0,
-        }}>
-          {isPaused ? '▶ RESUME' : '⏸ PAUSE'}
-        </button>
+
       </header>
 
       {/* ── MAIN ROW: Graph + Feed ─────────────────────────── */}
@@ -581,6 +589,22 @@ export default function App() {
               {reasoningLog.length} ENTRIES
             </span>
           </div>
+          
+          {finalBrief && (
+            <div style={{
+              margin: '12px 12px 0 12px', padding: '16px', borderRadius: '4px',
+              background: 'rgba(0, 255, 136, 0.05)', border: '1px solid #00FF8840',
+              boxShadow: '0 0 15px rgba(0, 255, 136, 0.1)'
+            }}>
+              <h3 style={{ fontFamily: 'Orbitron', fontSize: '0.85rem', color: '#00FF88', marginBottom: '8px', letterSpacing: '0.1em' }}>
+                ⭐ EXECUTIVE ACTION PLAN
+              </h3>
+              <p style={{ fontFamily: 'Space Mono', fontSize: '0.8rem', color: '#E8EDF5', lineHeight: 1.6, margin: 0, whiteSpace: 'pre-wrap' }}>
+                {finalBrief}
+              </p>
+            </div>
+          )}
+
           <div ref={feedRef} style={{ flex:1, overflowY:'auto', padding:'10px 12px' }}>
             {reasoningLog.length === 0 ? (
               <div style={{ display:'flex', flexDirection:'column', alignItems:'center',
