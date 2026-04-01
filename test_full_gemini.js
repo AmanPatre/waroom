@@ -18,7 +18,7 @@ Output ONLY strict JSON matching this exact schema:
     const promptText = `CRISIS: We have 2 hours to decide our response to a competitor's price drop.
 MEM0 DATA: No previous data found.`;
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -1,9 +1,9 @@
 
 
 use spacetimedb::{table, reducer, ReducerContext, ProcedureContext, Table, ScheduleAt};
-use spacetimedb::http::Request;
-use std::time::Duration;
 use serde_json::Value;
+
+
 
 // =============================================================================
 // CONSTANTS — loaded from your .env at BUILD TIME via the Rust env!() macro.
@@ -15,7 +15,7 @@ use serde_json::Value;
 
 const GEMINI_API_KEY: &str = env!("GEMINI_API_KEY", "Missing env var: GEMINI_API_KEY — load your .env before building");
 const MEM0_API_KEY:   &str = env!("MEM0_API_KEY",   "Missing env var: MEM0_API_KEY — load your .env before building");
-const GEMINI_URL:     &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const GEMINI_URL:     &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 const MEM0_SEARCH_URL: &str = "https://api.mem0.ai/v1/memories/search/";
 const MEM0_ADD_URL:    &str = "https://api.mem0.ai/v1/memories/";
 
@@ -78,10 +78,44 @@ pub struct ReasoningLog {
 }
 
 // =============================================================================
-// TABLE: agent_messages
-// Inter-agent message bus. Agents post messages here; recipients read and mark
-// them as read. Also used by the human "inject belief" feature.
+// TABLE: structured_memory
+// Advanced hybrid semantic+structured memory of an agent's insights.
 // =============================================================================
+
+#[table(accessor = structured_memory, public)]
+pub struct StructuredMemory {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub pattern: String,
+    pub insight: String,
+    pub decision: String,
+    pub confidence: f32,
+    pub predicted_outcome: String,
+    pub source_agent: String,
+    pub timestamp: u64,
+}
+
+// =============================================================================
+// TABLE: decision_log
+// Final synthesis outcomes for pattern learning feedback loops.
+// =============================================================================
+
+#[table(accessor = decision_log, public)]
+pub struct DecisionLog {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    pub pattern: String,
+    pub decision: String,
+    pub reasoning_summary: String,
+    pub confidence: f32,
+    pub predicted_outcome: String,
+    pub timestamp: u64,
+}
+
+// =============================================================================
+// TABLE: agent_messages
 
 #[derive(Clone)]
 #[table(accessor = agent_messages, public)]
@@ -119,6 +153,15 @@ pub struct SharedContext {
 // SCHEDULE TABLES — one per agent
 // Each scheduled row fires its linked procedure every 30 seconds.
 // =============================================================================
+
+/// Pre-flight classification.
+#[table(accessor = pattern_extractor_schedule, scheduled(pattern_extractor_think))]
+pub struct PatternExtractorSchedule {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+}
 
 /// Drives Scout's 30-second think cycle.
 #[table(accessor = scout_schedule, scheduled(scout_think))]
@@ -216,7 +259,10 @@ pub fn init(ctx: &ReducerContext) {
 pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
     let now = current_timestamp_secs!(ctx);
 
-    // Kill any legacy background daemons
+    // Kills legacy daemons
+    let sched_ids: Vec<_> = ctx.db.pattern_extractor_schedule().iter().map(|s| s.scheduled_id).collect();
+    for id in sched_ids { ctx.db.pattern_extractor_schedule().scheduled_id().delete(id); }
+
     let sched_ids: Vec<_> = ctx.db.scout_schedule().iter().map(|s| s.scheduled_id).collect();
     for id in sched_ids { ctx.db.scout_schedule().scheduled_id().delete(id); }
     
@@ -241,13 +287,20 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
         updated_at: now,
     });
 
-    // Set all agents to "thinking" so the frontend status indicators update
+    ctx.db.shared_context().key().delete("current_cycle".to_string());
+    ctx.db.shared_context().insert(SharedContext {
+        key:        "current_cycle".to_string(),
+        value:      "1".to_string(),
+        updated_at: now,
+    });
+
+    // Set all agents to "waiting" until pattern is extracted
     for agent_id in &["scout", "strategist", "devils_advocate"] {
         if ctx.db.agent().agent_id().find(agent_id.to_string()).is_some() {
             ctx.db.agent().agent_id().delete(agent_id.to_string());
             ctx.db.agent().insert(Agent {
-                status:       "thinking".to_string(),
-                current_task: format!("Processing crisis: {}", &crisis[..crisis.len().min(60)]),
+                status:       "waiting".to_string(),
+                current_task: "Awaiting crisis pattern classification...".to_string(),
                 last_updated: now,
                 ..Agent {
                     agent_id:     agent_id.to_string(),
@@ -266,11 +319,12 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
         }
     }
 
-    // Schedule exactly one execution for all three agents, staggered slightly
-    // to firmly prevent tx context lock panics inside check_and_write_final_brief.
-    ctx.db.scout_schedule().insert(ScoutSchedule { scheduled_id: 0, scheduled_at: ScheduleAt::from(Duration::from_millis(500)) });
-    ctx.db.strategist_schedule().insert(StrategistSchedule { scheduled_id: 0, scheduled_at: ScheduleAt::from(Duration::from_millis(1500)) });
-    ctx.db.devils_schedule().insert(DevilsSchedule { scheduled_id: 0, scheduled_at: ScheduleAt::from(Duration::from_millis(2500)) });
+    // Schedule EXACTLY the pattern extractor to run immediately
+    let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+    ctx.db.pattern_extractor_schedule().insert(PatternExtractorSchedule { 
+        scheduled_id: 0, 
+        scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 100_000)) 
+    });
 
     // Delete any old final_brief if it exists
     ctx.db.shared_context().key().delete("final_brief".to_string());
@@ -355,31 +409,100 @@ fn build_gemini_request(prompt: &str, system_instruction: &str) -> Vec<u8> {
     body.to_string().into_bytes()
 }
 
-/// Build a Mem0 memory-search request body.
-fn build_mem0_search_body(query: &str, user_id: &str) -> Vec<u8> {
+/// Build a Mem0 memory-add request body explicitly encoding the outcome and confidence.
+fn build_mem0_add_body(content: &str, user_id: &str, pattern: &str, confidence: f32, predicted_outcome: &str) -> Vec<u8> {
     serde_json::json!({
-        "query": query,
+        "messages": [{ "role": "user", "content": content }],
         "user_id": user_id,
-        "limit": 5
+        "metadata": {
+            "pattern": pattern,
+            "confidence": confidence,
+            "predicted_outcome": predicted_outcome
+        }
     })
     .to_string()
     .into_bytes()
 }
 
-/// Build a Mem0 memory-add request body.
-fn build_mem0_add_body(content: &str, user_id: &str) -> Vec<u8> {
-    serde_json::json!({
-        "messages": [{ "role": "assistant", "content": content }],
-        "user_id": user_id
-    })
-    .to_string()
-    .into_bytes()
+/// Helper: Queries Mem0, parses the results, applies the (similarity + confidence) formula, and returns formatted Top 3 insights.
+fn retrieve_mem0_insights(ctx: &mut ProcedureContext, crisis_text: &str, user_id: &str) -> String {
+    let mem0_body = serde_json::json!({
+        "query": crisis_text,
+        "user_id": user_id,
+        "limit": 10
+    }).to_string().into_bytes();
+
+    use spacetimedb::http::Request;
+    let raw_resp = match ctx.http.send(
+        Request::builder()
+            .method("POST")
+            .uri(MEM0_SEARCH_URL)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Token {}", MEM0_API_KEY))
+            .body(mem0_body)
+            .unwrap()
+    ) {
+        Ok(resp) => resp.into_parts().1.into_string_lossy(),
+        Err(e) => {
+            log::error!("[mem0] search failed: {:?}", e);
+            return String::new();
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&raw_resp) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    let mut results: Vec<(f64, String)> = Vec::new();
+    if let Some(arr) = parsed.as_array() {
+        for (idx, item) in arr.iter().enumerate() {
+            let score = item["score"].as_f64().unwrap_or(0.0);
+            let mem_text = item["memory"].as_str().unwrap_or("").to_string();
+            let mut conf = 0.5;
+            let mut pattern = "unknown".to_string();
+
+            if let Some(meta) = item.get("metadata") {
+                if let Some(c) = meta.get("confidence") { conf = c.as_f64().unwrap_or(0.5); }
+                if let Some(p) = meta.get("pattern") { pattern = p.as_str().unwrap_or("unknown").to_string(); }
+            }
+            
+            let final_score = score + conf;
+            let display_text = format!("{}. [Pattern: {}, Conf: {:.2}] {}", idx + 1, pattern, conf, mem_text);
+            results.push((final_score, display_text));
+        }
+    }
+
+    results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    
+    let top_3: Vec<String> = results.into_iter().take(3).map(|(_, s)| s).collect();
+    
+    if top_3.is_empty() {
+        return "No relevant past insights available.".to_string();
+    }
+    
+    format!("Relevant past insights from similar scenarios:\n{}\n\nUse these only if applicable. Do not blindly follow them.", top_3.join("\n"))
 }
 
 /// Extract the text payload from a Gemini response.
 /// Path: `candidates[0].content.parts[0].text`
 fn extract_gemini_text(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
+
+    // If Google returns an API error directly (e.g. 429 Quota Exceeded), capture and display it!
+    if let Some(err_obj) = v.get("error") {
+        if let Some(msg) = err_obj.get("message") {
+            let error_text = format!("SYSTEM ERROR: {}", msg.as_str().unwrap_or("Quota or API Error"));
+            let fallback_json = serde_json::json!({
+                "reasoning": error_text,
+                "decision": "RATE LIMIT HIT",
+                "confidence": 0.0,
+                "has_conflict": false
+            });
+            return Some(fallback_json.to_string());
+        }
+    }
+
     let text_val = v.get("candidates")?.get(0)?.get("content")?.get("parts")?.get(0)?.get("text")?.as_str()?;
     
     let mut cleaned = text_val.trim();
@@ -396,6 +519,108 @@ fn extract_gemini_text(raw: &str) -> Option<String> {
 }
 
 // =============================================================================
+// PROCEDURE: pattern_extractor_think
+// Fires exactly once per launch.
+// Quickly classifies the crisis, saves pattern/severe to shared_context,
+// and then physically schedules the 3 main agents.
+// =============================================================================
+
+#[spacetimedb::procedure]
+fn pattern_extractor_think(ctx: &mut ProcedureContext, _arg: PatternExtractorSchedule) {
+    log::info!("[pattern_extractor] think cycle starting");
+
+    let crisis_text = ctx.with_tx(|tx_ctx| {
+        tx_ctx.db.shared_context().key().find("crisis".to_owned())
+            .map(|r| r.value)
+            .unwrap_or_else(|| "No crisis defined".to_string())
+    });
+
+    let system_instruction = "You are the Pattern Extractor for an elite crisis swarm. \
+        Read the user's crisis and classify its core pattern type (e.g., 'price_competition', 'supply_chain_failure', 'pr_disaster'), \
+        its severity ('low', 'medium', 'high', 'critical'), and its domain. \
+        You must respond ONLY in valid JSON with exactly these keys: \
+        pattern (string), severity (string), domain (string)";
+
+    let prompt = format!("CRISIS: {}", crisis_text);
+    let gemini_url = format!("{}?key={}", GEMINI_URL, GEMINI_API_KEY);
+    let gemini_body = build_gemini_request(&prompt, system_instruction);
+
+    use spacetimedb::http::Request;
+    
+    let gemini_raw = match ctx.http.send(
+        Request::builder()
+            .method("POST")
+            .uri(&gemini_url)
+            .header("Content-Type", "application/json")
+            .body(gemini_body)
+            .unwrap(),
+    ) {
+        Ok(resp) => resp.into_parts().1.into_string_lossy(),
+        Err(e) => {
+            log::error!("[pattern_extractor] Gemini call failed: {:?}", e);
+            "{\"pattern\":\"unknown\",\"severity\":\"critical\",\"domain\":\"unknown\"}".to_string()
+        }
+    };
+
+    let parsed_text = extract_gemini_text(&gemini_raw).unwrap_or(gemini_raw);
+    let parsed: Value = serde_json::from_str(&parsed_text).unwrap_or_else(|e| {
+        log::error!("[pattern_extractor] JSON parse error: {:?}", e);
+        serde_json::json!({
+            "pattern": "unknown",
+            "severity": "critical",
+            "domain": "unknown"
+        })
+    });
+
+    let pattern  = parsed["pattern"].as_str().unwrap_or("unknown").to_string();
+    let severity = parsed["severity"].as_str().unwrap_or("critical").to_string();
+    let domain   = parsed["domain"].as_str().unwrap_or("unknown").to_string();
+
+    let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+    let now_secs = (now_micros / 1_000_000) as u64;
+
+    ctx.with_tx(|tx_ctx| {
+        // Save pattern info to shared context
+        tx_ctx.db.shared_context().key().delete("crisis_pattern".to_string());
+        tx_ctx.db.shared_context().insert(SharedContext {
+            key: "crisis_pattern".to_string(),
+            value: pattern.clone(),
+            updated_at: now_secs,
+        });
+
+        // Set agents to thinking BEFORE queuing them
+        for agent_id in &["scout", "strategist", "devils_advocate"] {
+            if let Some(agent) = tx_ctx.db.agent().agent_id().find(agent_id.to_string()) {
+                let updated = Agent {
+                    status: "thinking".to_string(),
+                    current_task: format!("{} | {} priority", pattern, severity),
+                    last_updated: now_secs,
+                    ..agent
+                };
+                tx_ctx.db.agent().agent_id().delete(agent_id.to_string());
+                tx_ctx.db.agent().insert(updated);
+            }
+        }
+
+        // Schedule the agents for strict sequential execution
+        tx_ctx.db.scout_schedule().insert(ScoutSchedule { 
+            scheduled_id: 0, 
+            scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 500_000)) 
+        });
+        tx_ctx.db.strategist_schedule().insert(StrategistSchedule { 
+            scheduled_id: 0, 
+            scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 4_500_000)) 
+        });
+        tx_ctx.db.devils_schedule().insert(DevilsSchedule { 
+            scheduled_id: 0, 
+            scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 8_500_000)) 
+        });
+    });
+
+    log::info!("[pattern_extractor] crisis classified: {} | {} | {}", pattern, severity, domain);
+}
+
+// =============================================================================
 // PROCEDURE: scout_think
 // Fires every 30 seconds via ScoutSchedule.
 // Gathers intelligence by querying Mem0 for context, asking Gemini to analyse
@@ -409,7 +634,7 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     // STEP 1 — Read current state from the database
     // -------------------------------------------------------------------------
-    let (crisis_text, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
         // Read crisis from shared_context
         let crisis = tx_ctx
             .db
@@ -418,6 +643,14 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
             .find("crisis".to_owned())
             .map(|r| r.value)
             .unwrap_or_else(|| "No crisis defined".to_string());
+
+        let pattern = tx_ctx
+            .db
+            .shared_context()
+            .key()
+            .find("crisis_pattern".to_owned())
+            .map(|r| r.value)
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Collect unread messages addressed to "scout"
         let msgs: Vec<AgentMessage> = tx_ctx
@@ -430,7 +663,7 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
         // Fetch the scout agent row (for context / logging)
         let agent = tx_ctx.db.agent().agent_id().find("scout".to_owned());
 
-        (crisis, msgs, agent)
+        (crisis, pattern, msgs, agent)
     });
 
     // Mark unread messages as read
@@ -456,44 +689,29 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     // STEP 2 — Retrieve relevant memories from Mem0
     // -------------------------------------------------------------------------
-    use spacetimedb::http::Request;
-
-    let mem0_body = build_mem0_search_body(&crisis_text, "agent_scout");
-    let mem0_response_text = match ctx.http.send(
-        Request::builder()
-            .method("POST")
-            .uri(MEM0_SEARCH_URL)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Token {}", MEM0_API_KEY))
-            .body(mem0_body)
-            .unwrap(),
-    ) {
-        Ok(resp) => resp.into_parts().1.into_string_lossy(),
-        Err(e) => {
-            log::error!("[scout] Mem0 search failed: {:?}", e);
-            String::new()
-        }
-    };
+    let mem0_response_text = retrieve_mem0_insights(ctx, &crisis_text, "agent_scout");
 
     // -------------------------------------------------------------------------
     // STEP 3 — Call Gemini for intelligence analysis
     // -------------------------------------------------------------------------
     let system_instruction = "You are Scout, an elite intelligence gathering agent in a crisis \
-        response AI swarm. Your role is to find facts, signals, market data, and evidence \
-        relevant to the crisis. Be specific, analytical, and data-driven. \
+        response AI swarm. Find facts, signals, market data, and evidence relevant to the crisis. \
         You must respond ONLY in valid JSON with exactly these keys: \
-        reasoning (string - your detailed analysis), \
-        decision (string - your key finding or recommended next investigation), \
-        confidence (float between 0.0 and 1.0), \
-        memory_to_store (string - the single most important fact to remember), \
+        reasoning (string - detailed analysis), \
+        decision (string - key finding or recommended next investigation), \
+        confidence (float 0.0-1.0), \
+        predicted_outcome (string - predicted result of your findings), \
+        memory_to_store (string - compressed insight to permanently remember), \
         message_to_strategist (string - intelligence briefing for Strategist agent)";
 
     let prompt = format!(
         "CRISIS: {crisis_text}\n\n\
-         YOUR MEMORIES FROM PREVIOUS CYCLES:\n{mem0_response_text}\n\n\
+         {mem0_response_text}\n\n\
          UNREAD MESSAGES:\n{msgs_text}\n\n\
-         Analyze the crisis. Provide your intelligence report."
+         Analyze the crisis."
     );
+    
+    log::info!("[scout] PROMPT GENERATED\nCRISIS: {}\nMEMORIES PARSED", crisis_text);
 
     let gemini_url = format!("{}?key={}", GEMINI_URL, GEMINI_API_KEY);
     let gemini_body = build_gemini_request(&prompt, system_instruction);
@@ -530,9 +748,10 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     let parsed: Value = serde_json::from_str(&parsed_text).unwrap_or_else(|e| {
         log::error!("[scout] JSON parse error: {:?}", e);
         serde_json::json!({
-            "reasoning": "Failed to parse Gemini response (Google Rate Limit Reached)",
+            "reasoning": "Failed to parse Gemini response",
             "decision": "",
             "confidence": 0.0,
+            "predicted_outcome": "",
             "memory_to_store": "",
             "message_to_strategist": ""
         })
@@ -541,14 +760,16 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     let reasoning            = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision             = parsed["decision"].as_str().unwrap_or("").to_string();
     let confidence           = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+    let predicted_outcome    = parsed["predicted_outcome"].as_str().unwrap_or("").to_string();
     let memory_to_store      = parsed["memory_to_store"].as_str().unwrap_or("").to_string();
     let message_to_strategist = parsed["message_to_strategist"].as_str().unwrap_or("").to_string();
 
     // -------------------------------------------------------------------------
     // STEP 5 — Store the most important fact in Mem0
     // -------------------------------------------------------------------------
+    use spacetimedb::http::Request;
     if !memory_to_store.is_empty() {
-        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_scout");
+        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_scout", &crisis_pattern, confidence, &predicted_outcome);
         if let Err(e) = ctx.http.send(
             Request::builder()
                 .method("POST")
@@ -567,6 +788,19 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     let now = current_timestamp_secs!(ctx);
     ctx.with_tx(|tx_ctx| {
+        if !memory_to_store.is_empty() {
+            tx_ctx.db.structured_memory().insert(StructuredMemory {
+                id: 0,
+                pattern: crisis_pattern.clone(),
+                insight: memory_to_store.clone(),
+                decision: decision.clone(),
+                confidence,
+                predicted_outcome: predicted_outcome.clone(),
+                source_agent: "scout".to_string(),
+                timestamp: now,
+            });
+        }
+
         // Append reasoning log entry
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id:       0,
@@ -622,7 +856,7 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     // -------------------------------------------------------------------------
     // STEP 1 — Read state
     // -------------------------------------------------------------------------
-    let (crisis_text, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
         let crisis = tx_ctx
             .db
             .shared_context()
@@ -630,6 +864,14 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
             .find("crisis".to_owned())
             .map(|r| r.value)
             .unwrap_or_else(|| "No crisis defined".to_string());
+
+        let pattern = tx_ctx
+            .db
+            .shared_context()
+            .key()
+            .find("crisis_pattern".to_owned())
+            .map(|r| r.value)
+            .unwrap_or_else(|| "unknown".to_string());
 
         let msgs: Vec<AgentMessage> = tx_ctx
             .db
@@ -639,7 +881,7 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
             .collect();
 
         let agent = tx_ctx.db.agent().agent_id().find("strategist".to_owned());
-        (crisis, msgs, agent)
+        (crisis, pattern, msgs, agent)
     });
 
     ctx.with_tx(|tx_ctx| {
@@ -663,24 +905,7 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     // -------------------------------------------------------------------------
     // STEP 2 — Mem0 memory retrieval
     // -------------------------------------------------------------------------
-    use spacetimedb::http::Request;
-
-    let mem0_body = build_mem0_search_body(&crisis_text, "agent_strategist");
-    let mem0_response_text = match ctx.http.send(
-        Request::builder()
-            .method("POST")
-            .uri(MEM0_SEARCH_URL)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Token {}", MEM0_API_KEY))
-            .body(mem0_body)
-            .unwrap(),
-    ) {
-        Ok(resp) => resp.into_parts().1.into_string_lossy(),
-        Err(e) => {
-            log::error!("[strategist] Mem0 search failed: {:?}", e);
-            String::new()
-        }
-    };
+    let mem0_response_text = retrieve_mem0_insights(ctx, &crisis_text, "agent_strategist");
 
     // -------------------------------------------------------------------------
     // STEP 3 — Gemini decision synthesis
@@ -690,14 +915,15 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
         Your role is to form clear, actionable recommendations. Be decisive but consider all angles. \
         You must respond ONLY in valid JSON with exactly these keys: \
         reasoning (string), \
-        decision (string - your specific recommendation), \
+        decision (string - specific recommendation), \
         confidence (float 0.0-1.0), \
-        memory_to_store (string), \
+        predicted_outcome (string), \
+        memory_to_store (string - compressed insight to permanently remember), \
         message_to_devils_advocate (string - present your recommendation for scrutiny)";
 
     let prompt = format!(
         "CRISIS: {crisis_text}\n\n\
-         YOUR MEMORIES FROM PREVIOUS CYCLES:\n{mem0_response_text}\n\n\
+         {mem0_response_text}\n\n\
          UNREAD MESSAGES:\n{msgs_text}\n\n\
          Synthesise the intelligence and provide your recommendation."
     );
@@ -742,6 +968,7 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
             "reasoning": "Failed to parse Gemini response",
             "decision": "",
             "confidence": 0.0,
+            "predicted_outcome": "",
             "memory_to_store": "",
             "message_to_devils_advocate": ""
         })
@@ -750,14 +977,16 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     let reasoning                 = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision                  = parsed["decision"].as_str().unwrap_or("").to_string();
     let confidence                = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+    let predicted_outcome         = parsed["predicted_outcome"].as_str().unwrap_or("").to_string();
     let memory_to_store           = parsed["memory_to_store"].as_str().unwrap_or("").to_string();
     let message_to_devils_advocate = parsed["message_to_devils_advocate"].as_str().unwrap_or("").to_string();
 
     // -------------------------------------------------------------------------
     // STEP 5 — Store memory in Mem0
     // -------------------------------------------------------------------------
+    use spacetimedb::http::Request;
     if !memory_to_store.is_empty() {
-        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_strategist");
+        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_strategist", &crisis_pattern, confidence, &predicted_outcome);
         if let Err(e) = ctx.http.send(
             Request::builder()
                 .method("POST")
@@ -776,6 +1005,19 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     // -------------------------------------------------------------------------
     let now = current_timestamp_secs!(ctx);
     ctx.with_tx(|tx_ctx| {
+        if !memory_to_store.is_empty() {
+            tx_ctx.db.structured_memory().insert(StructuredMemory {
+                id: 0,
+                pattern: crisis_pattern.clone(),
+                insight: memory_to_store.clone(),
+                decision: decision.clone(),
+                confidence,
+                predicted_outcome: predicted_outcome.clone(),
+                source_agent: "strategist".to_string(),
+                timestamp: now,
+            });
+        }
+
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id:       0,
             agent_id:     "strategist".to_string(),
@@ -828,7 +1070,7 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     // STEP 1 — Read state
     // -------------------------------------------------------------------------
-    let (crisis_text, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
         let crisis = tx_ctx
             .db
             .shared_context()
@@ -836,6 +1078,14 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
             .find("crisis".to_owned())
             .map(|r| r.value)
             .unwrap_or_else(|| "No crisis defined".to_string());
+
+        let pattern = tx_ctx
+            .db
+            .shared_context()
+            .key()
+            .find("crisis_pattern".to_owned())
+            .map(|r| r.value)
+            .unwrap_or_else(|| "unknown".to_string());
 
         let msgs: Vec<AgentMessage> = tx_ctx
             .db
@@ -845,7 +1095,7 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
             .collect();
 
         let agent = tx_ctx.db.agent().agent_id().find("devils_advocate".to_owned());
-        (crisis, msgs, agent)
+        (crisis, pattern, msgs, agent)
     });
 
     ctx.with_tx(|tx_ctx| {
@@ -869,22 +1119,7 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     // STEP 2 — Mem0 memory retrieval
     // -------------------------------------------------------------------------
-    let mem0_body = build_mem0_search_body(&crisis_text, "agent_devils_advocate");
-    let mem0_response_text = match ctx.http.send(
-        Request::builder()
-            .method("POST")
-            .uri(MEM0_SEARCH_URL)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Token {}", MEM0_API_KEY))
-            .body(mem0_body)
-            .unwrap(),
-    ) {
-        Ok(resp) => resp.into_parts().1.into_string_lossy(),
-        Err(e) => {
-            log::error!("[devils_advocate] Mem0 search failed: {:?}", e);
-            String::new()
-        }
-    };
+    let mem0_response_text = retrieve_mem0_insights(ctx, &crisis_text, "agent_devils_advocate");
 
     // -------------------------------------------------------------------------
     // STEP 3 — Gemini critical challenge
@@ -897,13 +1132,14 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
         reasoning (string), \
         decision (string - your counter-argument or alternative), \
         confidence (float 0.0-1.0), \
-        memory_to_store (string), \
+        predicted_outcome (string), \
+        memory_to_store (string - compressed insight to permanently remember), \
         has_conflict (boolean), \
         challenge_to_strategist (string)";
 
     let prompt = format!(
         "CRISIS: {crisis_text}\n\n\
-         YOUR MEMORIES FROM PREVIOUS CYCLES:\n{mem0_response_text}\n\n\
+         {mem0_response_text}\n\n\
          UNREAD MESSAGES:\n{msgs_text}\n\n\
          Challenge the current strategy. Find weaknesses and risks."
     );
@@ -948,6 +1184,7 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
             "reasoning": "Failed to parse Gemini response",
             "decision": "",
             "confidence": 0.0,
+            "predicted_outcome": "",
             "memory_to_store": "",
             "has_conflict": false,
             "challenge_to_strategist": ""
@@ -957,6 +1194,7 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     let reasoning              = parsed["reasoning"].as_str().unwrap_or("").to_string();
     let decision               = parsed["decision"].as_str().unwrap_or("").to_string();
     let confidence             = parsed["confidence"].as_f64().unwrap_or(0.0) as f32;
+    let predicted_outcome      = parsed["predicted_outcome"].as_str().unwrap_or("").to_string();
     let memory_to_store        = parsed["memory_to_store"].as_str().unwrap_or("").to_string();
     // has_conflict comes directly from the LLM — Devil's Advocate controls this flag
     let has_conflict           = parsed["has_conflict"].as_bool().unwrap_or(false);
@@ -965,8 +1203,9 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     // STEP 5 — Store memory in Mem0
     // -------------------------------------------------------------------------
+    use spacetimedb::http::Request;
     if !memory_to_store.is_empty() {
-        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_devils_advocate");
+        let mem0_add_body = build_mem0_add_body(&memory_to_store, "agent_devils_advocate", &crisis_pattern, confidence, &predicted_outcome);
         if let Err(e) = ctx.http.send(
             Request::builder()
                 .method("POST")
@@ -985,6 +1224,19 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     // -------------------------------------------------------------------------
     let now = current_timestamp_secs!(ctx);
     ctx.with_tx(|tx_ctx| {
+        if !memory_to_store.is_empty() {
+            tx_ctx.db.structured_memory().insert(StructuredMemory {
+                id: 0,
+                pattern: crisis_pattern.clone(),
+                insight: memory_to_store.clone(),
+                decision: decision.clone(),
+                confidence,
+                predicted_outcome: predicted_outcome.clone(),
+                source_agent: "devils_advocate".to_string(),
+                timestamp: now,
+            });
+        }
+
         // Log entry — note has_conflict is set from the parsed LLM response
         tx_ctx.db.reasoning_log().insert(ReasoningLog {
             log_id: 0,
@@ -1036,22 +1288,72 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
 // =============================================================================
 
 fn check_and_write_final_brief(ctx: &mut ProcedureContext) {
-    let (current_time, all_done, crisis, agent_decisions) = ctx.with_tx(|tx_ctx| {
+    let (current_time, all_done, crisis, pattern, agent_decisions, current_cycle) = ctx.with_tx(|tx_ctx| {
         let current_time = tx_ctx.db.agent().iter().map(|a| a.last_updated).max().unwrap_or(0);
         let all_done = tx_ctx.db.agent().iter().all(|a| a.status == "idle" || a.status == "error" || a.status == "paused");
         
         let crisis = tx_ctx.db.shared_context().key().find("crisis".to_owned())
             .map(|r| r.value).unwrap_or_default();
             
+        let pattern = tx_ctx.db.shared_context().key().find("crisis_pattern".to_owned())
+            .map(|r| r.value).unwrap_or_else(|| "unknown".to_string());
+            
+        let current_cycle = tx_ctx.db.shared_context().key().find("current_cycle".to_owned())
+            .map(|r| r.value.parse::<u32>().unwrap_or(1))
+            .unwrap_or(1);
+            
         let decisions: Vec<String> = tx_ctx.db.reasoning_log().iter()
             .map(|l| format!("{}:\nDecision: {}", l.agent_id, l.decision))
             .collect();
             
-        (current_time, all_done, crisis, decisions)
+        (current_time, all_done, crisis, pattern, decisions, current_cycle)
     });
 
     if all_done && !agent_decisions.is_empty() {
-        log::info!("[warroom] All 3 agents completed their cycle! Synthesizing final brief...");
+        if current_cycle < 3 {
+             log::info!("[warroom] Cycle {} complete! Triggering Cycle {}...", current_cycle, current_cycle + 1);
+             
+             let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+             let new_cycle = current_cycle + 1;
+             
+             ctx.with_tx(|tx_ctx| {
+                 tx_ctx.db.shared_context().key().delete("current_cycle".to_string());
+                 tx_ctx.db.shared_context().insert(SharedContext {
+                     key: "current_cycle".to_string(),
+                     value: new_cycle.to_string(),
+                     updated_at: current_time,
+                 });
+                 
+                 for agent_id in &["scout", "strategist", "devils_advocate"] {
+                     if let Some(agent) = tx_ctx.db.agent().agent_id().find(agent_id.to_string()) {
+                         let updated = Agent {
+                             status: "thinking".to_string(),
+                             current_task: format!("Cycle {} of 3: Deepening insights...", new_cycle),
+                             last_updated: current_time,
+                             ..agent
+                         };
+                         tx_ctx.db.agent().agent_id().delete(agent_id.to_string());
+                         tx_ctx.db.agent().insert(updated);
+                     }
+                 }
+                 
+                 tx_ctx.db.scout_schedule().insert(ScoutSchedule { 
+                     scheduled_id: 0, 
+                     scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 500_000)) 
+                 });
+                 tx_ctx.db.strategist_schedule().insert(StrategistSchedule { 
+                     scheduled_id: 0, 
+                     scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 4_500_000)) 
+                 });
+                 tx_ctx.db.devils_schedule().insert(DevilsSchedule { 
+                     scheduled_id: 0, 
+                     scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 8_500_000)) 
+                 });
+             });
+             return;
+        }
+
+        log::info!("[warroom] All 3 agents completed 3 cycles! Synthesizing final brief...");
         
         let system_instruction = "You are the Commander of the AI warroom. Read the crisis and the independent insights generated by your agents. Write a highly professional, definitive 3-sentence action plan resolving the crisis. DO NOT use markdown codeblocks. Output plain concise text.";
         let prompt = format!("CRISIS:\n{}\n\nAGENT STRATEGIES:\n{}", crisis, agent_decisions.join("\n\n"));
@@ -1081,8 +1383,19 @@ fn check_and_write_final_brief(ctx: &mut ProcedureContext) {
                 value: final_text.clone(),
                 updated_at: current_time,
             });
+
+            // Log this final decision structure
+            tx_ctx.db.decision_log().insert(DecisionLog {
+                id: 0,
+                pattern: pattern.clone(),
+                decision: final_text.clone(),
+                reasoning_summary: agent_decisions.join(" | "),
+                confidence: 0.9,
+                predicted_outcome: "Synthesis Outcome".to_string(),
+                timestamp: current_time,
+            });
         });
         
-        log::info!("[warroom] Final brief successfully written.");
+        log::info!("[warroom] Final brief successfully written and logged to Structured Memory.");
     }
 }
