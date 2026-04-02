@@ -230,6 +230,33 @@ body {
   cursor: not-allowed;
 }
 
+/* Command Override Button */
+.override-btn {
+  background: rgba(255, 184, 0, 0.08);
+  border: 1px solid rgba(255, 184, 0, 0.3) !important;
+  color: var(--strategist);
+  font-family: 'Rajdhani', sans-serif;
+  font-weight: 700;
+  font-size: 0.72rem;
+  letter-spacing: 0.15em;
+  padding: 8px 18px;
+  border-radius: var(--radius-sm);
+  transition: all 0.3s ease;
+  white-space: nowrap;
+}
+.override-btn:hover {
+  background: rgba(255, 184, 0, 0.15);
+  border-color: var(--strategist) !important;
+  box-shadow: 0 0 15px rgba(255, 184, 0, 0.1);
+}
+.override-btn.active {
+  background: var(--strategist);
+  color: var(--bg-primary);
+  border-color: var(--strategist) !important;
+  box-shadow: 0 0 20px rgba(255, 184, 0, 0.3);
+  animation: overridePulse 2s infinite;
+}
+
 /* ── Tabs ──────────────────────────────────── */
 .tab-bar {
   display: flex;
@@ -663,6 +690,20 @@ body {
   background: linear-gradient(135deg, rgba(0, 212, 255, 0.22), rgba(0, 212, 255, 0.12));
   box-shadow: 0 0 14px rgba(0, 212, 255, 0.15);
 }
+.inject-input.locked {
+  background: rgba(15, 23, 42, 0.5);
+  border-color: var(--text-faint);
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+.inject-btn.locked {
+  background: transparent;
+  border-color: var(--text-faint) !important;
+  color: var(--text-faint);
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none !important;
+}
 .inject-history {
   display: flex;
   gap: 6px;
@@ -831,6 +872,10 @@ body {
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
+}
+@keyframes overridePulse {
+  0%, 100% { box-shadow: 0 0 10px rgba(255, 184, 0, 0.2); }
+  50%       { box-shadow: 0 0 25px rgba(255, 184, 0, 0.5); }
 }
 
 /* ================================================================

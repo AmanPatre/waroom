@@ -298,6 +298,19 @@ function AgentGraph({ agents, agentMessages, reasoningLog }) {
                 className="node-pulse-ring"
               />
             )}
+            {/* Warning pulse when paused */}
+            {agent?.status === "paused" && (
+              <circle
+                cx={cx}
+                cy={cy}
+                r={46}
+                fill="none"
+                stroke="var(--strategist)"
+                strokeWidth={1.5}
+                strokeOpacity={0.6}
+                className="node-pulse-ring"
+              />
+            )}
             {/* Outer glow */}
             <circle
               cx={cx}
@@ -565,8 +578,9 @@ export default function App() {
     : [];
 
   // ── LIVE MODE Reducers ──────────────────────────────────────
-  const spawnSwarm = useReducer(reducers.spawnSwarm);
-  const injectBelief = useReducer(reducers.injectBelief);
+  const spawnSwarm = useReducer(reducers.spawnSwarm || ((...args) => {}));
+  const injectBelief = useReducer(reducers.injectBelief || ((...args) => {}));
+  const togglePause = useReducer(reducers.togglePause || ((...args) => {}));
 
   // ── Legacy DEV hooks ───────────────────────────────────────
   const [devAgents, setAgents] = useState(INITIAL_AGENTS);
@@ -576,7 +590,6 @@ export default function App() {
     { key: "crisis", value: DEV_CRISIS },
   ]);
   const [sessionSecs, setSessionSecs] = useState(0);
-  const [isPaused, setIsPaused] = useState(false);
   const [isLaunched, setIsLaunched] = useState(false);
   const [mem0Memories, setMem0Memories] = useState([]);
   const [showLaunch, setShowLaunch] = useState(false);
@@ -628,6 +641,7 @@ export default function App() {
   // ── Derived ────────────────────────────────────────────────
   const crisis =
     sharedContext.find((c) => c.key === "crisis")?.value ?? DEV_CRISIS;
+  const isPaused = sharedContext.find((c) => c.key === "is_paused")?.value === "true";
   const finalBrief = sharedContext.find((c) => c.key === "final_brief")?.value;
   const totalConflicts = reasoningLog.filter((r) => r.hasConflict).length;
   const avgConfidence = reasoningLog.length
@@ -846,10 +860,22 @@ export default function App() {
           })}
         </div>
 
+        {isLaunched && (
+          <button
+            className={`override-btn ${isPaused ? "active" : ""}`}
+            onClick={() => {
+              console.log("COMMAND OVERRIDE CLICKED. Target state:", !isPaused);
+              togglePause(!isPaused);
+            }}
+          >
+            {isPaused ? "⏯ RESUME SWARM" : "⏸ COMMAND OVERRIDE"}
+          </button>
+        )}
+
         <button
           className="launch-btn"
           onClick={() => setShowLaunch(true)}
-          disabled={isSwarmActive}
+          disabled={isSwarmActive && !isPaused}
         >
           {isSwarmActive
             ? "⟳ SWARM ACTIVE..."
@@ -908,6 +934,29 @@ export default function App() {
               )}
 
               <div ref={feedRef} className="feed-scroll">
+                {isPaused && (
+                  <div
+                    style={{
+                      position: "sticky",
+                      top: 0,
+                      zIndex: 10,
+                      background: "rgba(255, 184, 0, 0.15)",
+                      border: "1px solid rgba(255, 184, 0, 0.3)",
+                      borderRadius: "var(--radius-sm)",
+                      padding: "8px 12px",
+                      textAlign: "center",
+                      fontFamily: "Orbitron",
+                      fontSize: "0.65rem",
+                      color: "var(--strategist)",
+                      letterSpacing: "0.15em",
+                      marginBottom: "12px",
+                      backdropFilter: "blur(4px)",
+                      boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+                    }}
+                  >
+                    ⚠️ SYSTEM PAUSED — AWAITING HUMAN INJECTION
+                  </div>
+                )}
                 {reasoningLog.length === 0 ? (
                   <div className="feed-empty">
                     <span className="feed-empty-icon">🧠</span>
@@ -1014,14 +1063,19 @@ export default function App() {
             </select>
 
             <input
-              className="inject-input"
+              className={`inject-input ${!isPaused ? "locked" : ""}`}
               value={injInput}
               onChange={(e) => setInjInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleInject()}
-              placeholder="Inject strategic insight..."
+              onKeyDown={(e) => e.key === "Enter" && isPaused && handleInject()}
+              placeholder={isPaused ? "Inject strategic insight..." : "PAUSE SWARM TO INJECT BELIEF"}
+              disabled={!isPaused}
             />
 
-            <button className="inject-btn" onClick={handleInject}>
+            <button 
+              className={`inject-btn ${!isPaused ? "locked" : ""}`} 
+              onClick={handleInject}
+              disabled={!isPaused}
+            >
               INJECT ⚡
             </button>
 
