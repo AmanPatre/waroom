@@ -938,7 +938,38 @@ export default function App() {
               {finalBrief && (
                 <div className="action-plan fade-in">
                   <h3>⭐ EXECUTIVE ACTION PLAN</h3>
-                  <p>{finalBrief}</p>
+                  {(() => {
+                    try {
+                      const parsed = JSON.parse(finalBrief);
+                      if (parsed && typeof parsed === 'object') {
+                        if (typeof parsed.action_plan === 'string') {
+                          return <p>{parsed.action_plan}</p>;
+                        } else if (Array.isArray(parsed.action_plan)) {
+                          return (
+                            <ul style={{ paddingLeft: "1.5rem", marginTop: "0.5rem", listStyleType: "disc" }}>
+                              {parsed.action_plan.map((item, idx) => (
+                                <li key={idx} style={{ marginBottom: "0.75rem", lineHeight: "1.4" }}>
+                                  {item.instruction ? (
+                                    <>
+                                      <strong style={{ color: "var(--text-primary)" }}>Step {item.step || idx + 1}:</strong> {item.instruction}
+                                    </>
+                                  ) : typeof item === "string" ? (
+                                    item
+                                  ) : (
+                                    JSON.stringify(item)
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                          );
+                        }
+                        return <pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", margin: 0, fontFamily: "inherit" }}>{JSON.stringify(parsed, null, 2)}</pre>;
+                      }
+                      return <p>{finalBrief}</p>;
+                    } catch (e) {
+                      return <p>{finalBrief}</p>;
+                    }
+                  })()}
                 </div>
               )}
 

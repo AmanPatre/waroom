@@ -261,6 +261,7 @@ pub fn init(ctx: &ReducerContext) {
 
 #[reducer]
 pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
+    log::info!("[warroom] >>> RECEIVED SPAWN_SWARM REQUEST <<<");
     let now = current_timestamp_secs!(ctx);
 
     // Kills legacy daemons
@@ -283,6 +284,12 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
     let msg_ids: Vec<_> = ctx.db.agent_messages().iter().map(|m| m.msg_id).collect();
     for id in msg_ids { ctx.db.agent_messages().msg_id().delete(id); }
 
+    let mem_ids: Vec<_> = ctx.db.structured_memory().iter().map(|m| m.id).collect();
+    for id in mem_ids { ctx.db.structured_memory().id().delete(id); }
+
+    let dec_ids: Vec<_> = ctx.db.decision_log().iter().map(|d| d.id).collect();
+    for id in dec_ids { ctx.db.decision_log().id().delete(id); }
+
     // Delete-then-reinsert pattern for primary-key upsert
     ctx.db.shared_context().key().delete("crisis".to_string());
     ctx.db.shared_context().insert(SharedContext {
@@ -295,6 +302,16 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
     ctx.db.shared_context().insert(SharedContext {
         key:        "current_cycle".to_string(),
         value:      "1".to_string(),
+        updated_at: now,
+    });
+
+    // Reset pause state defensively
+    if let Some(_) = ctx.db.shared_context().key().find("is_paused".to_string()) {
+        ctx.db.shared_context().key().delete("is_paused".to_string());
+    }
+    ctx.db.shared_context().insert(SharedContext {
+        key: "is_paused".to_string(),
+        value: "false".to_string(),
         updated_at: now,
     });
 
@@ -332,6 +349,8 @@ pub fn spawn_swarm(ctx: &ReducerContext, crisis: String) {
 
     // Delete any old final_brief if it exists
     ctx.db.shared_context().key().delete("final_brief".to_string());
+    ctx.db.shared_context().key().delete("crisis_pattern".to_string());
+    ctx.db.shared_context().key().delete("mem0_memories".to_string());
 
     log::info!("[warroom] swarm launched — single shot execution queued.");
 }
@@ -369,6 +388,23 @@ pub fn mark_read(ctx: &ReducerContext, msg_id: u64) {
         ctx.db.agent_messages().msg_id().delete(msg_id);
         ctx.db.agent_messages().insert(updated);
     }
+}
+
+#[reducer]
+pub fn toggle_pause(ctx: &ReducerContext, paused: bool) {
+    let now = current_timestamp_secs!(ctx);
+    log::info!("[warroom] RECEIVE TOGGLE_PAUSE: {}", paused);
+    
+    // SAFE DELETE: Only delete if the key exists to avoid panic/rollback
+    if let Some(_) = ctx.db.shared_context().key().find("is_paused".to_string()) {
+        ctx.db.shared_context().key().delete("is_paused".to_string());
+    }
+    
+    ctx.db.shared_context().insert(SharedContext {
+        key: "is_paused".to_string(),
+        value: if paused { "true".to_string() } else { "false".to_string() },
+        updated_at: now,
+    });
 }
 
 // =============================================================================
@@ -540,7 +576,7 @@ fn pattern_extractor_think(ctx: &mut ProcedureContext, _arg: PatternExtractorSch
     });
 
     let system_instruction = "You are the Pattern Extractor for an elite crisis swarm. \
-        Read the user's crisis and classify its core pattern type (e.g., 'price_competition', 'supply_chain_failure', 'pr_disaster'), \
+        Read the user's crisis and classify its core pattern type (e.g., 'price_competition', 'supply_chain_failure', 'geopolitical_instability', 'investment_strategy', 'seasonal_opportunity', 'market_sentiment', 'pr_disaster'), \
         its severity ('low', 'medium', 'high', 'critical'), and its domain. \
         You must respond ONLY in valid JSON with exactly these keys: \
         pattern (string), severity (string), domain (string)";
@@ -638,7 +674,11 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
     // -------------------------------------------------------------------------
     // STEP 1 — Read current state from the database
     // -------------------------------------------------------------------------
-    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, unread_msgs, is_paused) = ctx.with_tx(|tx_ctx| {
+        let paused = tx_ctx.db.shared_context().key().find("is_paused".to_string())
+            .map(|r| r.value == "true")
+            .unwrap_or(false);
+
         // Read crisis from shared_context
         let crisis = tx_ctx
             .db
@@ -667,8 +707,30 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
         // Fetch the scout agent row (for context / logging)
         let agent = tx_ctx.db.agent().agent_id().find("scout".to_owned());
 
-        (crisis, pattern, msgs, agent)
+        (crisis, pattern, msgs, paused)
     });
+
+    if is_paused {
+        log::info!("[scout] swarm paused — heartbeat scheduled (3s)");
+        let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+        ctx.with_tx(|tx_ctx| {
+            if let Some(agent) = tx_ctx.db.agent().agent_id().find("scout".to_string()) {
+                let updated = Agent {
+                    status: "paused".to_string(),
+                    current_task: "Waiting for human command...".to_string(),
+                    last_updated: (now_micros / 1_000_000) as u64,
+                    ..agent
+                };
+                tx_ctx.db.agent().agent_id().delete("scout".to_string());
+                tx_ctx.db.agent().insert(updated);
+            }
+            tx_ctx.db.scout_schedule().insert(ScoutSchedule {
+                scheduled_id: 0,
+                scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 3_000_000))
+            });
+        });
+        return;
+    }
 
     // Mark unread messages as read
     ctx.with_tx(|tx_ctx| {
@@ -857,10 +919,11 @@ fn scout_think(ctx: &mut ProcedureContext, _arg: ScoutSchedule) {
 fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
     log::info!("[strategist] think cycle starting");
 
-    // -------------------------------------------------------------------------
-    // STEP 1 — Read state
-    // -------------------------------------------------------------------------
-    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, is_paused, unread_msgs) = ctx.with_tx(|tx_ctx| {
+        let paused = tx_ctx.db.shared_context().key().find("is_paused".to_string())
+            .map(|r| r.value == "true")
+            .unwrap_or(false);
+
         let crisis = tx_ctx
             .db
             .shared_context()
@@ -885,8 +948,30 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
             .collect();
 
         let agent = tx_ctx.db.agent().agent_id().find("strategist".to_owned());
-        (crisis, pattern, msgs, agent)
+        (crisis, pattern, paused, msgs)
     });
+
+    if is_paused {
+        log::info!("[strategist] swarm paused — heartbeat scheduled (3s)");
+        let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+        ctx.with_tx(|tx_ctx| {
+            if let Some(agent) = tx_ctx.db.agent().agent_id().find("strategist".to_string()) {
+                let updated = Agent {
+                    status: "paused".to_string(),
+                    current_task: "Human intervention in progress...".to_string(),
+                    last_updated: (now_micros / 1_000_000) as u64,
+                    ..agent
+                };
+                tx_ctx.db.agent().agent_id().delete("strategist".to_string());
+                tx_ctx.db.agent().insert(updated);
+            }
+            tx_ctx.db.strategist_schedule().insert(StrategistSchedule {
+                scheduled_id: 0,
+                scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 3_000_000))
+            });
+        });
+        return;
+    }
 
     ctx.with_tx(|tx_ctx| {
         for msg in &unread_msgs {
@@ -1071,10 +1156,11 @@ fn strategist_think(ctx: &mut ProcedureContext, _arg: StrategistSchedule) {
 fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
     log::info!("[devils_advocate] think cycle starting");
 
-    // -------------------------------------------------------------------------
-    // STEP 1 — Read state
-    // -------------------------------------------------------------------------
-    let (crisis_text, crisis_pattern, unread_msgs, _agent_row) = ctx.with_tx(|tx_ctx| {
+    let (crisis_text, crisis_pattern, is_paused, unread_msgs) = ctx.with_tx(|tx_ctx| {
+        let paused = tx_ctx.db.shared_context().key().find("is_paused".to_string())
+            .map(|r| r.value == "true")
+            .unwrap_or(false);
+
         let crisis = tx_ctx
             .db
             .shared_context()
@@ -1099,8 +1185,30 @@ fn devils_think(ctx: &mut ProcedureContext, _arg: DevilsSchedule) {
             .collect();
 
         let agent = tx_ctx.db.agent().agent_id().find("devils_advocate".to_owned());
-        (crisis, pattern, msgs, agent)
+        (crisis, pattern, paused, msgs)
     });
+
+    if is_paused {
+        log::info!("[devils] swarm paused — heartbeat scheduled (3s)");
+        let now_micros = ctx.timestamp.to_micros_since_unix_epoch() as i64;
+        ctx.with_tx(|tx_ctx| {
+            if let Some(agent) = tx_ctx.db.agent().agent_id().find("devils_advocate".to_string()) {
+                let updated = Agent {
+                    status: "paused".to_string(),
+                    current_task: "Strategy override active...".to_string(),
+                    last_updated: (now_micros / 1_000_000) as u64,
+                    ..agent
+                };
+                tx_ctx.db.agent().agent_id().delete("devils_advocate".to_string());
+                tx_ctx.db.agent().insert(updated);
+            }
+            tx_ctx.db.devils_schedule().insert(DevilsSchedule {
+                scheduled_id: 0,
+                scheduled_at: ScheduleAt::Time(spacetimedb::Timestamp::from_micros_since_unix_epoch(now_micros + 3_000_000))
+            });
+        });
+        return;
+    }
 
     ctx.with_tx(|tx_ctx| {
         for msg in &unread_msgs {
@@ -1411,11 +1519,21 @@ fn check_and_write_final_brief(ctx: &mut ProcedureContext) {
 
 #[spacetimedb::procedure]
 fn get_mem0_memories(ctx: &mut ProcedureContext) -> Result<(), String> {
-    log::info!("[memory_web] Fetching all memories from Mem0...");
+    // 1. Get current context for holistic (broad) recall
+    let crisis_query = ctx.with_tx(|tx_ctx| {
+        tx_ctx.db.shared_context().key().find("crisis".to_string())
+            .map(|r| r.value)
+            .unwrap_or_else(|| "crisis strategy".to_string())
+    });
+
+    log::info!("[memory_web] Holistic recall — searching for: '{}'...", 
+        if crisis_query.len() > 30 { format!("{}...", &crisis_query[..30]) } else { crisis_query.clone() }
+    );
     
+    // 2. Broad search without filters to allow "cross-pollination" of insights (e.g. war context in stocks)
     let mem0_search_body = serde_json::json!({
-        "query": "crisis strategy decision outcome",
-        "limit": 50,
+        "query": crisis_query,
+        "limit": 30,
         "user_id": "warroom_swarm"
     }).to_string().into_bytes();
 
@@ -1423,7 +1541,7 @@ fn get_mem0_memories(ctx: &mut ProcedureContext) -> Result<(), String> {
     match ctx.http.send(
         Request::builder()
             .method("POST")
-            .uri(&format!("{}?query=crisis&limit=50", MEM0_SEARCH_URL))
+            .uri(&format!("{}?query={}&limit=30", MEM0_SEARCH_URL, urlencoding::encode(&crisis_query)))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Token {}", MEM0_API_KEY))
             .body(mem0_search_body)
@@ -1431,10 +1549,11 @@ fn get_mem0_memories(ctx: &mut ProcedureContext) -> Result<(), String> {
     ) {
         Ok(response) => {
             let body = response.into_parts().1.into_string_lossy();
-            log::info!("[memory_web] Retrieved {} memories", body.len());
+            log::info!("[memory_web] Retrieved {} characters of memory data", body.len());
             // Store in shared context for frontend to read
             let now = current_timestamp_secs!(ctx);
             ctx.with_tx(|tx_ctx| {
+                tx_ctx.db.shared_context().key().delete("mem0_memories".to_string());
                 tx_ctx.db.shared_context().insert(SharedContext { 
                     key: "mem0_memories".to_string(), 
                     value: body.to_string(),
@@ -1449,3 +1568,78 @@ fn get_mem0_memories(ctx: &mut ProcedureContext) -> Result<(), String> {
         }
     }
 }
+
+// =============================================================================
+// REDUCER: nuke_session
+// Performs a SILENT wipe of all session data and stops. No thinking triggered.
+// =============================================================================
+
+#[reducer]
+pub fn nuke_session(ctx: &ReducerContext) {
+    log::info!("[warroom] >>> NUCLEAR RESET INITIATED <<<");
+    let now = current_timestamp_secs!(ctx);
+
+    // 1. Kill EVERY active schedule/daemon
+    let p_ids: Vec<_> = ctx.db.pattern_extractor_schedule().iter().map(|s| s.scheduled_id).collect();
+    for id in p_ids { ctx.db.pattern_extractor_schedule().scheduled_id().delete(id); }
+    
+    let s_ids: Vec<_> = ctx.db.scout_schedule().iter().map(|s| s.scheduled_id).collect();
+    for id in s_ids { ctx.db.scout_schedule().scheduled_id().delete(id); }
+    
+    let st_ids: Vec<_> = ctx.db.strategist_schedule().iter().map(|s| s.scheduled_id).collect();
+    for id in st_ids { ctx.db.strategist_schedule().scheduled_id().delete(id); }
+    
+    let d_ids: Vec<_> = ctx.db.devils_schedule().iter().map(|s| s.scheduled_id).collect();
+    for id in d_ids { ctx.db.devils_schedule().scheduled_id().delete(id); }
+
+    // 2. Wipe reasoning tables (Short-term memory)
+    let r_ids: Vec<_> = ctx.db.reasoning_log().iter().map(|r| r.log_id).collect();
+    for id in r_ids { ctx.db.reasoning_log().log_id().delete(id); }
+    
+    let m_ids: Vec<_> = ctx.db.agent_messages().iter().map(|m| m.msg_id).collect();
+    for id in m_ids { ctx.db.agent_messages().msg_id().delete(id); }
+    
+    let sm_ids: Vec<_> = ctx.db.structured_memory().iter().map(|m| m.id).collect();
+    for id in sm_ids { ctx.db.structured_memory().id().delete(id); }
+    
+    let dl_ids: Vec<_> = ctx.db.decision_log().iter().map(|d| d.id).collect();
+    for id in dl_ids { ctx.db.decision_log().id().delete(id); }
+
+    // 3. Reset all agents to standing_by
+    for agent_id in &["scout", "strategist", "devils_advocate"] {
+        if ctx.db.agent().agent_id().find(agent_id.to_string()).is_some() {
+            ctx.db.agent().agent_id().delete(agent_id.to_string());
+            ctx.db.agent().insert(Agent {
+                agent_id: agent_id.to_string(),
+                agent_type: match *agent_id {
+                    "scout" => "intelligence".to_string(),
+                    "strategist" => "strategy".to_string(),
+                    _ => "critic".to_string(),
+                },
+                status: "standing_by".to_string(),
+                current_task: "Waiting for next crisis...".to_string(),
+                confidence: 0.0,
+                last_updated: now,
+            });
+        }
+    }
+
+    // 4. Reset core context for display
+    ctx.db.shared_context().key().delete("crisis".to_string());
+    ctx.db.shared_context().insert(SharedContext {
+        key: "crisis".to_string(),
+        value: "System Ready. Waiting for input...".to_string(),
+        updated_at: now,
+    });
+    
+    // Explicitly wipe the "sticky" session context variables
+    ctx.db.shared_context().key().delete("current_cycle".to_string());
+    ctx.db.shared_context().key().delete("crisis_pattern".to_string());
+    ctx.db.shared_context().key().delete("mem0_memories".to_string());
+    ctx.db.shared_context().key().delete("final_brief".to_string());
+    ctx.db.shared_context().key().delete("is_paused".to_string());
+
+    log::info!("[warroom] >>> NUCLEAR RESET COMPLETE. SESSION IS ZERO. <<<");
+}
+
+
